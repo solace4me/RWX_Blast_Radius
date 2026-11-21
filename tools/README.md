@@ -8,3 +8,12 @@ Everything comes from sqlglot at the pinned commit `eb11aec4`. No sample answers
    so coverage also sees it.
 2. `buildmap.py` combines that into: line → tests, fixture → tests, function-body line ranges
    (from the AST), dialect inheritance, and which tests mention each dialect.
+3. `import_lines.py`, run under `coverage run --source=sqlglot`, records which lines run just from
+   importing every sqlglot module. A change there affects every user of the module, not only the
+   tests that happened to trigger the import.
+4. `sqlglot_src.tgz` holds sqlglot's `*.py` files at the pinned commit. At run time the selector
+   applies each patch to them in memory to:
+   - recognise comment-only edits (identical token stream, so no tests),
+   - recognise syntax errors (the module can't import, so all tests),
+   - map every edited line to its whole enclosing statement (or the enclosing block for inserted
+     statements) before looking up coverage.
