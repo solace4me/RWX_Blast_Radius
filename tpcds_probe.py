@@ -139,9 +139,14 @@ if __name__ == "__main__":
     parser.add_argument("inputs_path")
     parser.add_argument("base_path", nargs="?")
     parser.add_argument("--queries", metavar="I,J,...", help="zero-based query indices to compare")
+    parser.add_argument("--from", dest="start", type=int, help="compare queries from this index on")
     args = parser.parse_args()
     try:
         indices = [int(index) for index in args.queries.split(",")] if args.queries is not None else None
+        if args.start is not None:
+            with open(args.inputs_path, encoding="utf-8") as stream:
+                count = len(json.load(stream)["queries"])
+            indices = list(range(args.start, count))
         main(args.inputs_path, args.base_path, indices)
     except ValueError as exc:
         parser.error(str(exc))

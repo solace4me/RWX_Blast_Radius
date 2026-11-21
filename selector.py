@@ -45,7 +45,6 @@ TPCDS_BASE = Path(__file__).with_name("tpcds_base.json")  # written at image bui
 TPCDS_TYPES = Path(__file__).with_name("tpcds_types.json")
 TPCDS_QUERY_LINES = Path(__file__).with_name("tpcds_query_lines.json.gz")
 TPCDS_ID = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
-TPCDS_SCREEN_MIN_QUERY = 8
 WORKER_COST_MS = 2000
 MAX_WORKERS = 8
 FAMILIES = ("dialects", "parsers", "generators", "typing", "tokenizers")
@@ -413,12 +412,16 @@ class Selector:
                 notes.append("tpcds: executor-side lines changed, keep")
             else:
                 try:
-                    queries = self.tpcds_queries.affected_queries(runtime_lines) if self.tpcds_queries else None
-                    screen = queries[:1] if queries and queries[0] >= TPCDS_SCREEN_MIN_QUERY else ()
+                    # only runtime edits have line evidence; class-body edits replay everything
+                    queries = (
+                        self.tpcds_queries.affected_queries(runtime_lines)
+                        if self.tpcds_queries and not tpcds_import_files else None
+                    )
+                    first = queries[0] if queries else None
                     preload = sorted(
                         f[:-3].replace("/", ".") for f in tpcds_import_files
                     )
-                    same = tpcds_inputs_unchanged(patched, screen, preload)
+                    same = tpcds_inputs_unchanged(patched, first, preload)
                 except Exception as ex:
                     same = False
                     notes.append(f"tpcds probe failed {ex!r}")
@@ -625,24 +628,20 @@ runpy.run_path(probe, run_name="__main__")
 """
 
 
-def check_tpcds_inputs(command, env, screen):
+def check_tpcds_inputs(command, env, first_affected=None):
+    """SAME/DIFF over the TPC-DS queries. Queries before the first one whose
+    processing ran any changed line can't differ: up to that point the patched
+    run executes exactly the pinned code on the same inputs. So the comparison
+    starts there. Starting without those queries' leftover state can only
+    produce spurious differences (keeping the test), never hide one."""
     runtime = dict(cwd="/tmp", env=env, capture_output=True, text=True)
-    if screen:
-        subset = [*command, "--queries", ",".join(map(str, screen))]
-        try:
-            probe = subprocess.run(subset, timeout=2, **runtime)
-        except (OSError, subprocess.TimeoutExpired):
-            pass
-        else:
-            if probe.returncode == 0 and probe.stdout.strip() == "DIFF":
-                return False
-    # A matching subset supplies no evidence about the remaining queries or
-    # their shared state. Make the removal decision in a fresh ordered run.
+    if first_affected:
+        command = [*command, "--from", str(first_affected)]
     probe = subprocess.run(command, timeout=120, **runtime)
     return probe.returncode == 0 and probe.stdout.strip() == "SAME"
 
 
-def tpcds_inputs_unchanged(patched, screen=(), preload=()):
+def tpcds_inputs_unchanged(patched, first_affected=None, preload=()):
     """Run tpcds_probe.py on the patched tree and compare with the pinned
     commit's fingerprints. Any doubt (missing files, errors) -> False."""
     if not (TPCDS_BASE.exists() and TPCDS_PROBE.exists() and TPCDS_INPUTS.exists()):
@@ -664,7 +663,7 @@ def tpcds_inputs_unchanged(patched, screen=(), preload=()):
         # from sys.path explicitly.
         command = [sys.executable, "-s", "-B", "-c", TPCDS_RUN, str(base), str(overlay),
                    str(TPCDS_PROBE), str(TPCDS_INPUTS), str(TPCDS_BASE)]
-        return check_tpcds_inputs(command, env, screen)
+        return check_tpcds_inputs(command, env, first_affected)
     finally:
         shutil.rmtree(overlay, ignore_errors=True)
 
