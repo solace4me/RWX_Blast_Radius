@@ -4,7 +4,7 @@ tests=json.load(open(f'{KIT}/sample/tests.json'))['tests']
 num={t['id']:t['number'] for t in tests}
 lines=collections.defaultdict(lambda: collections.defaultdict(set))  # file->line->tests
 unmatched=set(); opened=collections.defaultdict(set)
-for d in glob.glob(os.path.expanduser('~/brout_*')):
+for d in glob.glob(os.path.expanduser(os.environ.get('BR_GLOB','~/brout_*'))):
     data=coverage.CoverageData(basename=os.path.join(d,'.coverage')); data.read()
     for f in data.measured_files():
         rel=os.path.relpath(f,ROOT)
@@ -26,7 +26,7 @@ missing=[t['id'] for t in tests if t['number'] not in covered]
 print('no-coverage tests',len(missing),missing[:10])
 out={'lines':{f:{str(l):sorted(s) for l,s in d.items()} for f,d in lines.items()},
      'opened':{p:sorted(s) for p,s in opened.items()}}
-json.dump(out,open(os.path.expanduser('~/map_raw.json'),'w'))
+json.dump(out,open(os.path.expanduser(os.environ.get('BR_MAPOUT','~/map_raw.json')),'w'))
 print('opened files',len(opened)); print(sorted(opened)[:15])
 
 # ---- dialect mention index & inheritance (for import-time changes) ----
@@ -71,7 +71,7 @@ for fx,ts in out['opened'].items():
         if p.search(body): mention[n].update(ts)
 out['mention']={n:sorted(s) for n,s in mention.items()}
 out['children']={n:sorted(s) for n,s in refs.items()}
-json.dump(out,open(os.path.expanduser('~/map_raw.json'),'w'))
+json.dump(out,open(os.path.expanduser(os.environ.get('BR_MAPOUT','~/map_raw.json')),'w'))
 print('children',{k:v for k,v in out['children'].items()})
 print('mention sizes',{n:len(s) for n,s in mention.items()})
 
@@ -93,5 +93,5 @@ for dp,dn,fn in os.walk(f'{ROOT}/sqlglot'):
             else: merged.append([a,b])
         bodies[rel]=merged
 out['bodies']=bodies
-json.dump(out,open(os.path.expanduser('~/map_raw.json'),'w'))
+json.dump(out,open(os.path.expanduser(os.environ.get('BR_MAPOUT','~/map_raw.json')),'w'))
 print('bodies files',len(bodies))

@@ -22,9 +22,12 @@ import bisect
 import gzip
 import io
 import tarfile
+import os
+import subprocess
 import tokenize
 import json
 import re
+import shutil
 import sys
 from pathlib import Path
 
@@ -63,6 +66,9 @@ class Selector:
             self.file_tests[f] = ft
         self.opened = {k: set(v) for k, v in m["opened"].items()}
         self.mention = {k: set(v) for k, v in m["mention"].items()}
+        # dialect name -> tests that used it at run time (through inheritance
+        # or lookups by name such as Dialect["teradata"])
+        self.uses = {k: set(v) for k, v in m.get("uses", {}).items()}
         self.children = m["children"]
         self.bodies = m["bodies"]
         self.body_starts = {f: [r[0] for r in rs] for f, rs in self.bodies.items()}
@@ -76,6 +82,7 @@ class Selector:
         # them whenever library code changes, since we can't tell what they need
         seen = set().union(*self.file_tests.values(), *self.opened.values())
         self.blind = self.all - seen
+        self.test_id = {t["number"]: t["id"] for t in tests}
 
     def in_body(self, f, ln):
         starts = self.body_starts.get(f)
@@ -93,12 +100,39 @@ class Selector:
                     stack.append(c)
         return out
 
+    def blind_for(self, f, import_time):
+        """Tests the map never saw run, narrowed by what each one checks."""
+        out = set()
+        for n in self.blind:
+            tid = self.test_id[n]
+            if tid.startswith("tests/test_sqlglotc.py::"):
+                # exercises sqlglotc/setup.py build plumbing, not sqlglot/ code
+                continue
+            if tid.endswith("::test_lazy_load"):
+                # runs `import sqlglot` in a subprocess: only import-time code matters
+                if import_time or f in (
+                    "sqlglot/__init__.py",
+                    "sqlglot/dialects/__init__.py",
+                    "sqlglot/dialects/dialect.py",
+                ):
+                    out.add(n)
+                continue
+            if tid.endswith("::test_no_redundant_expression_metadata"):
+                # reads sqlglot/typing sources and their EXPRESSION_METADATA
+                if import_time or f.startswith("sqlglot/typing/"):
+                    out.add(n)
+                continue
+            out.add(n)  # anything unknown: keep
+        return out
+
     def import_time_fallback(self, f):
-        sel = set(self.file_tests[f]) | self.blind
+        sel = set(self.file_tests[f]) | self.blind_for(f, True)
         parts = f.split("/")
-        if len(parts) == 3 and parts[1] in FAMILIES and parts[2][:-3] in self.mention:
-            for n in self.family(parts[2][:-3]):
+        name = parts[2][:-3] if len(parts) == 3 else None
+        if parts[1:2] and parts[1] in FAMILIES and (name in self.mention or name in self.uses):
+            for n in self.family(name):
                 sel |= self.mention.get(n, set())
+                sel |= self.uses.get(n, set())
         return sel
 
     def select_regions(self, f, regions):
@@ -121,7 +155,7 @@ class Selector:
                     sel.update(n for n in s if n >= 0)
         if import_time:
             return sel | self.import_time_fallback(f), f"import-time* {f}"
-        return sel | self.blind, f"statement-level {f} ({len(regions)} regions)"
+        return sel | self.blind_for(f, False), f"statement-level {f} ({len(regions)} regions)"
 
     def select_file(self, f, changed):
         if f.startswith("tests/"):
@@ -158,18 +192,68 @@ class Selector:
             return set(), f"ignored {f}"
         return self.all, f"other {f} -> all"
 
+    def select_removed(self, f):
+        """A file that no longer exists at this path (deleted or renamed away)."""
+        if f.startswith("sqlglot/"):
+            return self.all, f"removed {f} -> all"
+        if f.startswith("tests/"):
+            if f.endswith(".py"):
+                return self.by_test_file.get(f, self.all), f"removed test code {f}"
+            if f in self.opened:
+                return self.opened[f], f"removed fixture {f}"
+            return self.all, f"removed unknown test data {f} -> all"
+        if f.startswith(IGNORED_PREFIXES) or f.endswith(IGNORED_SUFFIXES):
+            return set(), f"removed ignored {f}"
+        return self.all, f"removed {f} -> all"
+
+    def select_added(self, f):
+        """A file that didn't exist before."""
+        if f.startswith(IGNORED_PREFIXES) or f.endswith(IGNORED_SUFFIXES):
+            return set(), f"added ignored {f}"
+        if f.startswith(("sqlglot/", "tests/")) or not "/" in f:
+            # new modules can shadow or be discovered; new test files can
+            # change collection. Rare, so stay safe.
+            return self.all, f"added {f} -> all"
+        return self.all, f"added {f} -> all"
+
     def select(self, patch_text):
         sel = set()
         notes = []
-        hunks = split_patch(patch_text)
-        for f, changed in parse_patch(patch_text).items():
-            if f.startswith("sqlglot/") and f.endswith(".py") and f in hunks:
-                kind, regions = analyse_source_change(f, hunks[f])
-                if kind == "code" and regions is not None and f in self.lines:
-                    s, note = self.select_regions(f, regions)
+        entries = parse_diff(patch_text)
+        if not entries and patch_text.strip():
+            return set(self.all), ["unparsed patch -> all"]
+        patched = {}  # sqlglot files whose code changed -> new text (None = gone)
+        import_modules = set()
+        for e in entries:
+            if e.binary:
+                f = e.path
+                if f.startswith(IGNORED_PREFIXES) or f.endswith(IGNORED_SUFFIXES):
+                    notes.append(f"binary ignored {f}")
+                    continue
+                sel |= self.all
+                notes.append(f"binary {f} -> all")
+                continue
+            if e.deleted or e.renamed:
+                s, note = self.select_removed(e.old)
+                sel |= s
+                notes.append(note)
+                if e.renamed:
+                    s, note = self.select_added(e.new)
                     sel |= s
                     notes.append(note)
-                    continue
+                continue
+            if e.added:
+                s, note = self.select_added(e.new)
+                sel |= s
+                notes.append(note)
+                continue
+            f = e.path
+            if not e.hunks:
+                notes.append(f"metadata-only {f}")  # e.g. a mode change
+                continue
+            changed = e.changed_old_lines()
+            if f.startswith("sqlglot/") and f.endswith(".py"):
+                kind, regions, new_text = analyse_source_change(f, e.hunks)
                 if kind == "noop":
                     notes.append(f"comment-only {f}")
                     continue
@@ -177,10 +261,47 @@ class Selector:
                     sel |= self.all
                     notes.append(f"syntax error {f} -> all")
                     continue
+                if new_text is not None:
+                    patched[f] = new_text
+                if kind == "code" and regions is not None and f in self.lines:
+                    s, note = self.select_regions(f, regions)
+                    sel |= s
+                    notes.append(note)
+                    if note.startswith("import-time"):
+                        import_modules |= self.modules_to_import(f)
+                    continue
+                if kind is None:
+                    # the patch doesn't apply to our copy: be safe
+                    sel |= self.all
+                    notes.append(f"patch does not apply to {f} -> all")
+                    continue
+                if f in self.lines:
+                    import_modules |= self.modules_to_import(f)
             s, note = self.select_file(f, changed)
             sel |= s
             notes.append(note)
+        if import_modules and patched and sel != self.all:
+            try:
+                broken = imports_break(patched, sorted(import_modules))
+            except Exception as ex:
+                broken = True
+                notes.append(f"import check failed {ex!r}")
+            if broken:
+                sel = set(self.all)
+                notes.append("import raises -> all")
+            else:
+                notes.append("imports ok")
         return sel, notes
+
+    def modules_to_import(self, f):
+        mods = {f[:-3].replace("/", ".").removesuffix(".__init__")}
+        parts = f.split("/")
+        if len(parts) == 3 and parts[1] in FAMILIES:
+            for n in self.family(parts[2][:-3]):
+                for fam in FAMILIES:
+                    mods.add(f"sqlglot.{fam}.{n}")
+        mods.add("sqlglot")
+        return mods
 
 
 _SOURCES = None
@@ -198,40 +319,189 @@ def original_source(path):
     return _SOURCES.get(path)
 
 
-def split_patch(text):
-    """file -> list of hunks; a hunk is (old_start, [(tag, text)]) with tag in ' -+'."""
-    files = {}
-    cur = None
-    minus_path = None
+_BASE = None
+IMPORT_CHECK = """
+import importlib, sys
+sys.path.insert(0, sys.argv[1])
+bad = []
+for name in sys.argv[2:]:
+    try:
+        importlib.import_module(name)
+    except ModuleNotFoundError as e:
+        if e.name and name.startswith(e.name):
+            continue  # module doesn't exist in this family
+        bad.append(name)
+    except BaseException:
+        bad.append(name)
+print("BAD" if bad else "OK")
+"""
+
+
+def base_tree():
+    """Extract pinned sqlglot sources once into /tmp (no bytecode anywhere)."""
+    global _BASE
+    if _BASE is None:
+        root = Path("/tmp/br_src")
+        if root.exists():
+            shutil.rmtree(root, ignore_errors=True)
+        with tarfile.open(SRC_PATH, "r:gz") as tar:
+            tar.extractall(root, filter="data")
+        _BASE = root
+    return _BASE
+
+
+def imports_break(patched, modules):
+    """Write the patched files over the pinned tree (None = delete), import
+    `modules` in a fresh interpreter that never reads or writes bytecode,
+    then restore the tree. True unless the probe exits 0 and prints OK."""
+    root = base_tree()
+    originals = {}
+    try:
+        for rel, text in patched.items():
+            target = root / rel
+            originals[rel] = target.read_text("utf-8") if target.exists() else None
+            if text is None:
+                target.unlink(missing_ok=True)
+            else:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(text, "utf-8")
+        # -B: never write bytecode; the tree is freshly extracted, so none exists
+        r = subprocess.run(
+            [sys.executable, "-I", "-B", "-c", IMPORT_CHECK, str(root), *modules],
+            cwd=str(root), capture_output=True, text=True, timeout=60,
+        )
+        return not (r.returncode == 0 and r.stdout.strip() == "OK")
+    finally:
+        for rel, text in originals.items():
+            target = root / rel
+            if text is None:
+                target.unlink(missing_ok=True)
+            else:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(text, "utf-8")
+
+
+class FileDiff:
+    """One file's part of a patch, with Git's metadata."""
+
+    def __init__(self, old=None, new=None):
+        self.old = old  # path before (None if the file is new)
+        self.new = new  # path after (None if the file is deleted)
+        self.added = False
+        self.deleted = False
+        self.binary = False
+        self.hunks = []  # [(old_start, [(tag, text)])]
+
+    @property
+    def path(self):
+        return self.new or self.old
+
+    @property
+    def renamed(self):
+        return self.old is not None and self.new is not None and self.old != self.new
+
+    def changed_old_lines(self):
+        """Old-file line numbers touched: removed lines, and the lines on both
+        sides of every insertion point."""
+        out = set()
+        for start, body in self.hunks:
+            old = start
+            for tag, _ in body:
+                if tag == "-":
+                    out.add(old)
+                    old += 1
+                elif tag == "+":
+                    out.add(old - 1)
+                    out.add(old)
+                else:
+                    old += 1
+        return out
+
+
+def _strip_prefix(p, prefix):
+    p = p.strip()
+    if p.startswith('"') and p.endswith('"'):
+        p = p[1:-1]
+    if p == "/dev/null":
+        return None
+    return p[len(prefix):] if p.startswith(prefix) else p
+
+
+HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+GIT_RE = re.compile(r"^diff --git (?:\"?a/)(.*?)\"? (?:\"?b/)(.*?)\"?$")
+
+
+def parse_diff(text):
+    """Parse a unified/Git diff into FileDiff entries. Hunk bodies are read
+    by their line counts, so content lines like '--- x' are never mistaken
+    for headers."""
+    entries = []
+    e = None
     hunk = None
-    for line in text.splitlines():
-        if line.startswith("diff --git"):
-            cur = None
-            hunk = None
-            continue
-        if line.startswith("--- ") and hunk is None or (line.startswith("--- ") and cur is None):
-            p = line[4:].strip()
-            minus_path = p[2:] if p.startswith("a/") else p
-            continue
-        if line.startswith("+++ ") and (hunk is None or cur is None):
-            p = line[4:].strip()
-            p = p[2:] if p.startswith("b/") else p
-            cur = minus_path if p == "/dev/null" else p
-            files.setdefault(cur, [])
-            hunk = None
-            continue
-        m = re.match(r"@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@", line)
-        if m and cur is not None:
-            hunk = (int(m.group(1)), [])
-            files[cur].append(hunk)
-            continue
-        if hunk is None:
-            continue
+    rem_old = rem_new = 0
+    for line in text.split("\n"):
+        if line.endswith("\r"):
+            line = line[:-1]
+        if hunk is not None and (rem_old > 0 or rem_new > 0):
+            if line.startswith("\\"):
+                continue
+            tag = line[:1] if line else " "
+            if tag in " -+":
+                if tag == " ":
+                    rem_old -= 1
+                    rem_new -= 1
+                elif tag == "-":
+                    rem_old -= 1
+                else:
+                    rem_new -= 1
+                hunk[1].append((tag, line[1:]))
+                continue
+        hunk = None
         if line.startswith("\\"):
             continue
-        tag = line[:1] if line[:1] in "+- " else " "
-        hunk[1].append((tag, line[1:]))
-    return files
+        m = GIT_RE.match(line)
+        if m:
+            e = FileDiff(m.group(1), m.group(2))
+            entries.append(e)
+            continue
+        if line.startswith("--- ") and (e is None or e.hunks):
+            e = FileDiff()
+            entries.append(e)
+        if e is None:
+            continue
+        if line.startswith("rename from ") or line.startswith("copy from "):
+            e.old = line.split(" from ", 1)[1].strip()
+            if line.startswith("copy"):
+                e.added = True
+        elif line.startswith("rename to ") or line.startswith("copy to "):
+            e.new = line.split(" to ", 1)[1].strip()
+        elif line.startswith("deleted file mode"):
+            e.deleted = True
+        elif line.startswith("new file mode"):
+            e.added = True
+        elif line.startswith("Binary files ") or line.startswith("GIT binary patch"):
+            e.binary = True
+        elif line.startswith("--- "):
+            e.old = _strip_prefix(line[4:], "a/")
+            if e.old is None:
+                e.added = True
+        elif line.startswith("+++ "):
+            e.new = _strip_prefix(line[4:], "b/")
+            if e.new is None:
+                e.deleted = True
+        else:
+            m = HUNK_RE.match(line)
+            if m:
+                hunk = (int(m.group(1)), [])
+                e.hunks.append(hunk)
+                rem_old = int(m.group(2)) if m.group(2) is not None else 1
+                rem_new = int(m.group(4)) if m.group(4) is not None else 1
+    for e in entries:
+        if e.deleted:
+            e.new = None
+        if e.added and not e.renamed:
+            e.old = None
+    return [e for e in entries if e.path]
 
 
 def apply_hunks(old, hunks):
@@ -274,33 +544,33 @@ CODING_RE = re.compile(r"^[ \t\f]*#.*?coding[:=]")
 
 
 def analyse_source_change(path, hunks):
-    """-> (kind, regions). kind: 'noop' (only comments/blank lines changed),
+    """-> (kind, regions, new_text). kind: 'noop' (only comments/blank lines changed),
     'syntax' (new file doesn't compile), 'code', or None (can't tell).
     regions (for 'code'): list of ('import', None) / ('runtime', old_lines)."""
     old = original_source(path)
     if old is None:
-        return None, None
+        return None, None, None
     new = apply_hunks(old, hunks)
     if new is None:
-        return None, None
+        return None, None, None
     try:
         compile(new, path, "exec", dont_inherit=True)
     except (SyntaxError, ValueError):
-        return "syntax", None
+        return "syntax", None, new
     head_old = old.split("\n")[:2]
     head_new = new.split("\n")[:2]
     coding_changed = any(CODING_RE.match(l) for l in head_old + head_new) and head_old != head_new
     try:
         if not coding_changed and code_tokens(old) == code_tokens(new):
-            return "noop", None
+            return "noop", None, new
     except (tokenize.TokenError, SyntaxError, IndentationError):
-        return None, None
+        return None, None, new
     if coding_changed:
-        return "code", [("import", None)]
+        return "code", [("import", None)], new
     try:
-        return "code", change_regions(old, new, hunks)
+        return "code", change_regions(old, new, hunks), new
     except Exception:
-        return "code", None
+        return "code", None, new
 
 
 def change_regions(old, new, hunks):
@@ -462,47 +732,6 @@ class StmtIndex:
         """True if line is in node's own text (not in a nested body)."""
         b = self.body_start(node)
         return b is None or line < b
-
-
-def parse_patch(text):
-    """file -> set of old-file line numbers touched (removed lines, and the
-    lines on both sides of every insertion point)."""
-    files = {}
-    cur = None
-    old = 0
-    minus_path = None
-    for line in text.splitlines():
-        if line.startswith("diff --git"):
-            cur = None
-            continue
-        if line.startswith("--- "):
-            p = line[4:].strip()
-            minus_path = p[2:] if p.startswith("a/") else p
-            continue
-        if line.startswith("+++ "):
-            p = line[4:].strip()
-            p = p[2:] if p.startswith("b/") else p
-            if p == "/dev/null":
-                p = minus_path
-            cur = p
-            files.setdefault(cur, set())
-            continue
-        m = re.match(r"@@ -(\d+)(?:,\d+)? \+", line)
-        if m:
-            old = int(m.group(1))
-            continue
-        if cur is None:
-            continue
-        if line.startswith("-"):
-            files[cur].add(old)
-            old += 1
-        elif line.startswith("+"):
-            files[cur].add(old - 1)
-            files[cur].add(old)
-        elif line.startswith(" ") or line == "":
-            old += 1
-    # a rename or mode change with no hunks still touches the file
-    return files
 
 
 def split(sel, ms):
