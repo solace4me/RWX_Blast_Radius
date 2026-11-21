@@ -81,6 +81,8 @@ class Selector:
         # dialect name -> tests that used it at run time (through inheritance
         # or lookups by name such as Dialect["teradata"])
         self.uses = {k: set(v) for k, v in m.get("uses", {}).items()}
+        # expression class name -> tests that created an instance of it or a subclass
+        self.inst = {k: set(v) for k, v in m.get("inst", {}).items()}
         self.children = m["children"]
         self.bodies = m["bodies"]
         self.body_starts = {f: [r[0] for r in rs] for f, rs in self.bodies.items()}
@@ -165,6 +167,11 @@ class Selector:
             for n in self.family(name):
                 sel |= self.mention.get(n, set())
                 sel |= self.uses.get(n, set())
+        if f.startswith("sqlglot/expressions/"):
+            # an edit to an expression class body (arg_types, flags...) matters
+            # to every test that builds that expression or a subclass of it
+            for c in classes:
+                sel |= self.inst.get(c, set())
         if not self.generator_related(f, classes):
             # test_generator_memory only measures memory retained by
             # repeatedly creating each dialect's Generator
