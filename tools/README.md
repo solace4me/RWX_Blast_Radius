@@ -23,3 +23,27 @@ Everything comes from sqlglot at the pinned commit `eb11aec4`. No sample answers
    `tpcds_types.json`. The selector can use these facts when the sole edit
    replaces `value is None` with `value == None`. Other edits follow the
    normal coverage and TPC-DS checks.
+6. `record_settings.py` records reads of literal settings on dialect classes
+   in the pinned suite. It distinguishes direct literal dictionary keys from
+   reads of the whole setting. A read during import, class construction or
+   known shared caching disables pruning for that setting. Tests with missing
+   pass reports or unobserved subprocess work retain their baseline selection.
+   The map includes the source hashes and the test catalog it was built for.
+7. `record_tpcds_query_lines.py` records the pinned probe's source lines by
+   query, including startup separately. The selector can test a late query
+   early when coverage points to it. Only a difference ends the probe early.
+   A match, timeout or unusable result still triggers the complete comparison
+   in the original query order.
+
+To regenerate the setting map, create an empty trace directory and run from
+the pinned checkout with CPython 3.13 and the locked test dependencies.
+`KIT` is the absolute path to this repository and `TRACE` is the absolute
+path to the trace directory.
+
+```sh
+PYTHONPATH="$KIT:$KIT/tools:${PYTHONPATH:-}" SKIP_INTEGRATION=0 \
+  BR_SETTINGS_CATALOG="$KIT/sample/tests.json" BR_SETTINGS_TRACE="$TRACE" \
+  python -B -m pytest -p record_settings -p no:cacheprovider -q tests
+PYTHONPATH="$KIT:${PYTHONPATH:-}" python -B "$KIT/tools/record_settings.py" \
+  "$TRACE" "$KIT/sample/tests.json" "$KIT/setting_reads.json.gz"
+```

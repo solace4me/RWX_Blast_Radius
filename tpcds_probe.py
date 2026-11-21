@@ -11,13 +11,14 @@ are covered separately: tools/tpcds_exec_lines.py records every line that runs
 from Plan(...) onwards. If all hashes match the pinned commit's and none of
 those lines changed, the test runs identical code on identical inputs.
 
-usage: PYTHONHASHSEED=0 python tpcds_probe.py INPUTS_JSON [BASE_HASHES_JSON]
+usage: PYTHONHASHSEED=0 python tpcds_probe.py INPUTS_JSON [BASE_HASHES_JSON] [--queries 0,4,17]
 (with a base file it prints SAME or DIFF, stopping at the first difference)
+Query indices are zero-based. A subset comparison only describes the selected
+queries. It can be used to screen for a difference before the full replay.
 """
 import hashlib
 import json
 import pickle
-import sys
 
 
 
@@ -70,16 +71,34 @@ class Digest:
 DEBUG = False
 
 
-def main(inputs_path, base_path=None):
+def main(inputs_path, base_path=None, query_indices=None, *, on_query=None):
     from sqlglot import find_tables, parse_one, transpile
     from sqlglot.optimizer import optimize
     from sqlglot.schema import ensure_schema
 
-    data = json.load(open(inputs_path))
-    base = json.load(open(base_path)) if base_path else None
+    with open(inputs_path, encoding="utf-8") as stream:
+        data = json.load(stream)
+    base = None
+    if base_path is not None:
+        with open(base_path, encoding="utf-8") as stream:
+            base = json.load(stream)
     schema = data["schema"]
+    queries = data["queries"]
+    if base is not None and len(base) != len(queries):
+        print("DIFF")
+        return
+    if query_indices is None:
+        query_indices = range(len(queries))
+    else:
+        query_indices = sorted(set(query_indices))
+        if not query_indices or query_indices[0] < 0 or query_indices[-1] >= len(queries):
+            raise ValueError("query indices must select at least one query within the input fixture")
+
     out = []
-    for sql, execute in data["queries"]:
+    for index in query_indices:
+        if on_query is not None:
+            on_query(index)
+        sql, execute = queries[index]
         parts = []
         try:
             tree = pickle.loads(pickle.dumps(parse_one(sql)))
@@ -98,15 +117,26 @@ def main(inputs_path, base_path=None):
             out.append([p if len(p) < 80 else _h(p) for p in parts])
             continue
         digest = hashlib.sha256("\n".join(parts).encode()).hexdigest()
-        if base is not None and (len(out) >= len(base) or base[len(out)] != digest):
+        if base is not None and base[index] != digest:
             print("DIFF")  # stop at the first difference
             return
         out.append(digest)
     if base is not None:
-        print("SAME" if len(out) == len(base) else "DIFF")
+        print("SAME")
     else:
         print(json.dumps(out))
 
 
 if __name__ == "__main__":
-    main(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else None)
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Fingerprint the TPC-DS inputs to the executor.")
+    parser.add_argument("inputs_path")
+    parser.add_argument("base_path", nargs="?")
+    parser.add_argument("--queries", metavar="I,J,...", help="zero-based query indices to compare")
+    args = parser.parse_args()
+    try:
+        indices = [int(index) for index in args.queries.split(",")] if args.queries is not None else None
+        main(args.inputs_path, args.base_path, indices)
+    except ValueError as exc:
+        parser.error(str(exc))

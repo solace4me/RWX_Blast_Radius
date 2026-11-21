@@ -29,16 +29,23 @@ import json
 import re
 import shutil
 import sys
+import zlib
 from pathlib import Path
+
+from setting_index import SettingIndex, edited_setting
+from tpcds_query_index import QueryIndex
 
 DATA = Path("/data")
 MAP_PATH = Path(__file__).with_name("map.json.gz")
+SETTING_READS = Path(__file__).with_name("setting_reads.json.gz")
 SRC_PATH = Path(__file__).with_name("sqlglot_src.tgz")
 TPCDS_PROBE = Path(__file__).with_name("tpcds_probe.py")
 TPCDS_INPUTS = Path(__file__).with_name("tpcds_inputs.json")
 TPCDS_BASE = Path(__file__).with_name("tpcds_base.json")  # written at image build
 TPCDS_TYPES = Path(__file__).with_name("tpcds_types.json")
+TPCDS_QUERY_LINES = Path(__file__).with_name("tpcds_query_lines.json.gz")
 TPCDS_ID = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+TPCDS_SCREEN_MIN_QUERY = 8
 WORKER_COST_MS = 2000
 MAX_WORKERS = 8
 FAMILIES = ("dialects", "parsers", "generators", "typing", "tokenizers")
@@ -84,9 +91,16 @@ class Selector:
                 st.update(range(a, b + 1))
             self.tpcds_exec[f] = st
         self.tpcds = {t["number"] for t in tests if t["id"] == TPCDS_ID}
+        self.tpcds_queries = QueryIndex.load(TPCDS_QUERY_LINES, TPCDS_INPUTS) if self.tpcds else None
         self.tpcds_types = {}
         if self.tpcds and TPCDS_TYPES.is_file():
             self.tpcds_types = json.loads(TPCDS_TYPES.read_text("utf-8"))
+        self.setting_index = None
+        if SETTING_READS.is_file():
+            try:
+                self.setting_index = SettingIndex.load(SETTING_READS, tests)
+            except (AttributeError, EOFError, KeyError, OSError, TypeError, ValueError, zlib.error) as ex:
+                log("setting read map disabled:", repr(ex))
         self.import_lines = {}
         for f, rs in m.get("importlines", {}).items():
             st = set()
@@ -341,6 +355,19 @@ class Selector:
                 notes.append("import raises -> all")
             else:
                 notes.append("imports ok")
+                if len(entries) == 1 and self.setting_index:
+                    f = entries[0].path
+                    before = original_source(f)
+                    if f in patched and before is not None and self.setting_index.matches_source(f, before):
+                        setting = edited_setting(before, patched[f])
+                        narrowed = self.setting_index.narrow(f, setting, sel)
+                        if narrowed is not None:
+                            # Source inspections and tests outside the line map retain
+                            # the original selector's conservative treatment.
+                            narrowed |= set(self.opened.get(f, ())) | (sel & self.blind)
+                            if len(narrowed) < len(sel):
+                                notes.append(f"setting reads: {len(sel)} -> {len(narrowed)}")
+                                sel = narrowed
         if (
             tpcds_ok
             and not import_modules
@@ -365,7 +392,9 @@ class Selector:
                 notes.append("tpcds: executor-side lines changed, keep")
             else:
                 try:
-                    same = tpcds_inputs_unchanged(patched)
+                    queries = self.tpcds_queries.affected_queries(runtime_lines) if self.tpcds_queries else None
+                    screen = queries[:1] if queries and queries[0] >= TPCDS_SCREEN_MIN_QUERY else ()
+                    same = tpcds_inputs_unchanged(patched, screen)
                 except Exception as ex:
                     same = False
                     notes.append(f"tpcds probe failed {ex!r}")
@@ -557,7 +586,24 @@ runpy.run_path(probe, run_name="__main__")
 """
 
 
-def tpcds_inputs_unchanged(patched):
+def check_tpcds_inputs(command, env, screen):
+    runtime = dict(cwd="/tmp", env=env, capture_output=True, text=True)
+    if screen:
+        subset = [*command, "--queries", ",".join(map(str, screen))]
+        try:
+            probe = subprocess.run(subset, timeout=2, **runtime)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        else:
+            if probe.returncode == 0 and probe.stdout.strip() == "DIFF":
+                return False
+    # A matching subset supplies no evidence about the remaining queries or
+    # their shared state. Make the removal decision in a fresh ordered run.
+    probe = subprocess.run(command, timeout=120, **runtime)
+    return probe.returncode == 0 and probe.stdout.strip() == "SAME"
+
+
+def tpcds_inputs_unchanged(patched, screen=()):
     """Run tpcds_probe.py on the patched tree and compare with the pinned
     commit's fingerprints. Any doubt (missing files, errors) -> False."""
     if not (TPCDS_BASE.exists() and TPCDS_PROBE.exists() and TPCDS_INPUTS.exists()):
@@ -574,14 +620,11 @@ def tpcds_inputs_unchanged(patched):
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(text, "utf-8")
         env = {"PYTHONHASHSEED": "0", "PATH": os.environ.get("PATH", "")}
-        r = subprocess.run(
-            # not -I: that would ignore PYTHONHASHSEED; the env is minimal and
-            # the script drops the working directory from sys.path itself
-            [sys.executable, "-s", "-B", "-c", TPCDS_RUN, str(base), str(overlay),
-             str(TPCDS_PROBE), str(TPCDS_INPUTS), str(TPCDS_BASE)],
-            cwd="/tmp", env=env, capture_output=True, text=True, timeout=120,
-        )
-        return r.returncode == 0 and r.stdout.strip() == "SAME"
+        # -I would ignore PYTHONHASHSEED. TPCDS_RUN removes the working directory
+        # from sys.path explicitly.
+        command = [sys.executable, "-s", "-B", "-c", TPCDS_RUN, str(base), str(overlay),
+                   str(TPCDS_PROBE), str(TPCDS_INPUTS), str(TPCDS_BASE)]
+        return check_tpcds_inputs(command, env, screen)
     finally:
         shutil.rmtree(overlay, ignore_errors=True)
 
