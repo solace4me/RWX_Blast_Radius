@@ -1,7 +1,7 @@
 # The scorer builds this on linux/amd64 and runs it with no network. The
 # digest is the image the organizers labeled every commit in.
 FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
-COPY selector.py map.json.gz sqlglot_src.tgz tpcds_probe.py tpcds_inputs.json /app/
+COPY selector.py map.json.gz sqlglot_src.tgz tpcds_probe.py tpcds_inputs.json tpcds_types.json /app/
 # Pinned sqlglot sources for the probes, precompiled with checked-hash
 # bytecode: Python re-validates each .pyc against its source on every import.
 # tpcds_base.json: the pinned commit's fingerprints of what test_execute_tpcds

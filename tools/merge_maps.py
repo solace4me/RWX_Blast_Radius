@@ -1,9 +1,10 @@
 """Union the coverage maps (py3.10 + py3.13) and add the extra tables -> map.json.gz.
 usage: merge_maps.py OUT map_raw.json map_raw13.json importlines.json importlines13.json
-                     dialect_uses_dir tpcds_exec_lines.json tests.json"""
+                     dialect_uses_dir tpcds_exec_lines.json tests.json [instantiations_dir]"""
 import collections, glob, gzip, json, os, sys
 
 out, a, b, il1, il2, usesdir, tpc, tests_json = sys.argv[1:9]
+instdir = sys.argv[9] if len(sys.argv) > 9 else None
 A, B = json.load(open(a)), json.load(open(b))
 num = {t["id"]: t["number"] for t in json.load(open(tests_json))["tests"]}
 
@@ -43,6 +44,30 @@ for f in glob.glob(os.path.join(usesdir, "*.json")):
         if k in num:
             for n in v:
                 uses[n].add(num[k])
+
+
+def ctx_tests(c):
+    """A test's own context -> itself; its setup/teardown -> its class; a
+    module's collection -> every test in it."""
+    if c in num:
+        return {num[c]}
+    if c.endswith("|setup") or c.endswith("|teardown"):
+        parts = c.rsplit("|", 1)[0].split("::")
+        prefix = "::".join(parts[:-1]) + "::" if len(parts) > 2 else parts[0] + "::"
+        return {n for i, n in num.items() if i.startswith(prefix)}
+    if c.startswith("collect:"):
+        node = c[len("collect:"):]
+        return {n for i, n in num.items() if i == node or i.startswith(node + "::")}
+    return set()
+
+
+inst = collections.defaultdict(set)  # class qualname -> tests that instantiated it (or a subclass)
+if instdir:
+    for f in glob.glob(os.path.join(instdir, "*.json")):
+        for k, v in json.load(open(f)).items():
+            ts = ctx_tests(k)
+            for q in v:
+                inst[q].update(ts)
 cl = {}
 for f, d in lines.items():
     g = {}
@@ -58,6 +83,7 @@ m = {
     "importlines": {f: ranges(v) for f, v in il.items()},
     "uses": {k: sorted(v) for k, v in uses.items() if k != "dialect"},
     "tpcds_exec": {f: ranges(v) for f, v in json.load(open(tpc)).items() if v},
+    "inst": {k: sorted(v) for k, v in inst.items()},
 }
 open(out, "wb").write(gzip.compress(json.dumps(m, separators=(",", ":")).encode(), 9))
 print(os.path.getsize(out) // 1024, "KB")

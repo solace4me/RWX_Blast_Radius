@@ -37,6 +37,7 @@ SRC_PATH = Path(__file__).with_name("sqlglot_src.tgz")
 TPCDS_PROBE = Path(__file__).with_name("tpcds_probe.py")
 TPCDS_INPUTS = Path(__file__).with_name("tpcds_inputs.json")
 TPCDS_BASE = Path(__file__).with_name("tpcds_base.json")  # written at image build
+TPCDS_TYPES = Path(__file__).with_name("tpcds_types.json")
 TPCDS_ID = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
 WORKER_COST_MS = 2000
 MAX_WORKERS = 8
@@ -73,6 +74,8 @@ class Selector:
         # dialect name -> tests that used it at run time (through inheritance
         # or lookups by name such as Dialect["teradata"])
         self.uses = {k: set(v) for k, v in m.get("uses", {}).items()}
+        # class name -> tests that created an instance of it or of a subclass
+        self.inst = {k: set(v) for k, v in m.get("inst", {}).items()}
         self.children = m["children"]
         self.bodies = m["bodies"]
         self.body_starts = {f: [r[0] for r in rs] for f, rs in self.bodies.items()}
@@ -83,6 +86,9 @@ class Selector:
                 st.update(range(a, b + 1))
             self.tpcds_exec[f] = st
         self.tpcds = {t["number"] for t in tests if t["id"] == TPCDS_ID}
+        self.tpcds_types = {}
+        if self.tpcds and TPCDS_TYPES.is_file():
+            self.tpcds_types = json.loads(TPCDS_TYPES.read_text("utf-8"))
         self.import_lines = {}
         for f, rs in m.get("importlines", {}).items():
             st = set()
@@ -147,6 +153,10 @@ class Selector:
             for n in self.family(name):
                 sel |= self.mention.get(n, set())
                 sel |= self.uses.get(n, set())
+        for c in classes:
+            # a class-level edit (arg_types, settings...) matters to whoever
+            # builds instances of that class
+            sel |= self.inst.get(c, set())
         if not self.generator_related(f, classes):
             # test_generator_memory only measures memory retained by
             # repeatedly creating each dialect's Generator
@@ -293,6 +303,8 @@ class Selector:
                 continue
             changed = e.changed_old_lines()
             if f.startswith("sqlglot/") and f.endswith(".py"):
+                # Tests that inspect source can be affected by comments too.
+                sel.update(self.opened.get(f, ()))
                 kind, regions, new_text = analyse_source_change(f, e.hunks)
                 if kind == "noop":
                     notes.append(f"comment-only {f}")
@@ -340,9 +352,17 @@ class Selector:
             and not import_modules
             and self.tpcds
             and self.tpcds <= sel
+            and sel != self.all
             and patched
             and runtime_lines
         ):
+            if len(entries) == 1:
+                f = entries[0].path
+                facts = self.tpcds_types.get(f)
+                if facts and equivalent_none_test(original_source(f), patched[f], facts):
+                    sel -= self.tpcds
+                    notes.append("tpcds: equivalent None comparison on observed types")
+                    return sel, notes
             touched = [
                 f for f, ls in runtime_lines.items()
                 if ls & self.tpcds_exec.get(f, set()) or ls & self.import_lines.get(f, set())
@@ -390,6 +410,50 @@ def original_source(path):
                 if member.isfile():
                     _SOURCES[member.name] = tar.extractfile(member).read().decode("utf-8")
     return _SOURCES.get(path)
+
+
+def equivalent_none_test(old, new, facts):
+    """Can the single edit only change an identity check to default equality?"""
+    old_lines = old.encode("utf-8").split(b"\n")
+    new_lines = new.encode("utf-8").split(b"\n")
+    if len(old_lines) != len(new_lines):
+        return False
+    changed = [(i, a, b) for i, (a, b) in enumerate(zip(old_lines, new_lines), 1) if a != b]
+    if len(changed) != 1:
+        return False
+    line, before, after = changed[0]
+    for start, end, types in facts.get(str(line), []):
+        # AST column offsets are UTF-8 byte offsets. Every recorded operand
+        # must be None itself or use object.__eq__, so equality with None
+        # cannot call code that changes the comparison's result or state.
+        if not types or any(
+            cls != "builtins.NoneType" and eq_owner != "builtins.object"
+            for cls, eq_owner in types
+        ):
+            continue
+        if before[start:end].strip() != b"is":
+            continue
+        prefix, suffix = before[:start], before[end:]
+        if after.startswith(prefix) and after.endswith(suffix):
+            operator = after[start:len(after) - len(suffix)].strip()
+            if operator == b"==":
+                return comparison_shape(old) == comparison_shape(new)
+    return False
+
+
+def comparison_shape(source):
+    """Compare syntax apart from the operator, preserving debug f-string text."""
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Compare)
+            and len(node.ops) == 1
+            and isinstance(node.ops[0], ast.Eq)
+            and isinstance(node.comparators[0], ast.Constant)
+            and node.comparators[0].value is None
+        ):
+            node.ops[0] = ast.Is()
+    return ast.dump(tree, include_attributes=False)
 
 
 _BASE = None
@@ -639,10 +703,11 @@ def parse_diff(text):
         else:
             m = HUNK_RE.match(line)
             if m:
-                hunk = (int(m.group(1)), [])
-                e.hunks.append(hunk)
                 rem_old = int(m.group(2)) if m.group(2) is not None else 1
                 rem_new = int(m.group(4)) if m.group(4) is not None else 1
+                # Git describes a zero-length old range by the line before it.
+                hunk = (int(m.group(1)) + (rem_old == 0), [])
+                e.hunks.append(hunk)
     for e in entries:
         if e.deleted:
             e.new = None
@@ -688,6 +753,7 @@ def code_tokens(text):
 
 
 CODING_RE = re.compile(r"^[ \t\f]*#.*?coding[:=]")
+CLAUSE_RE = re.compile(r"^(?P<indent>[ \t\f]*)(?P<keyword>else|finally)[ \t]*:")
 
 
 def analyse_source_change(path, hunks):
@@ -752,7 +818,8 @@ def change_regions(old, new, hunks):
         pos_old += 1
         pos_new += 1
 
-    parents_old = {id(e[0]): e for e in old_idx.nodes}
+    old_text_lines = old.split("\n")
+    new_text_lines = new.split("\n")
     regions = []
 
     def header_lines(idx, node):
@@ -764,13 +831,14 @@ def change_regions(old, new, hunks):
     parents_new_map = {id(x[0]): x for x in new_idx.nodes}
 
     def classes_of(entry, pmap):
-        names = set()
+        """Qualified name of the innermost enclosing class, e.g. 'Snowflake.Tokenizer'."""
+        chain = []
         cur = entry
         while cur is not None:
             if isinstance(cur[0], ast.ClassDef):
-                names.add(cur[0].name)
+                chain.append(cur[0].name)
             cur = pmap.get(id(cur[1])) if cur[1] is not None else None
-        return frozenset(names)
+        return frozenset({".".join(reversed(chain))} if chain else {"?"})
 
     def old_entry_at(old_line, like):
         """The old statement starting at old_line of the same type as `like`."""
@@ -780,24 +848,27 @@ def change_regions(old, new, hunks):
         return None
 
     for L in removed:
-        e = old_idx.innermost(L)
+        clause = old_idx.clause_owner(L, old_text_lines[L - 1])
+        e = clause or old_idx.innermost(L)
         if e is None:
             continue
         node, parent, in_func = e
-        if not old_idx.is_header_line(node, L):
+        if not clause and not old_idx.is_header_line(node, L):
             continue  # comment/blank line between statements
         if not in_func:
             regions.append(("import", classes_of(e, parents_old_map)))
         else:
-            regions.append(("runtime", header_lines(old_idx, node)))
+            lines = set(range(node.lineno, node.end_lineno + 1)) if clause else header_lines(old_idx, node)
+            regions.append(("runtime", lines))
 
     parents_new = {id(e[0]): e for e in new_idx.nodes}
     for N in added:
-        e = new_idx.innermost(N)
+        clause = new_idx.clause_owner(N, new_text_lines[N - 1])
+        e = clause or new_idx.innermost(N)
         if e is None:
             continue
         node, parent, in_func = e
-        if not new_idx.is_header_line(node, N):
+        if not clause and not new_idx.is_header_line(node, N):
             continue
         if not in_func:
             regions.append(("import", classes_of(e, parents_new_map)))
@@ -820,7 +891,9 @@ def change_regions(old, new, hunks):
             regions.append(("import", classes_of(e, parents_new_map)))
             continue
         (onode, oparent, oin), same_stmt = found
-        if same_stmt:
+        if clause and oin:
+            regions.append(("runtime", set(range(onode.lineno, onode.end_lineno + 1))))
+        elif same_stmt:
             # an existing statement was edited in place
             if oin:
                 regions.append(("runtime", header_lines(old_idx, onode)))
@@ -889,6 +962,22 @@ class StmtIndex:
                 ):
                     best = entry
         return best
+
+    def clause_owner(self, line, text):
+        """Find the compound statement even when the clause has an inline body."""
+        match = CLAUSE_RE.match(text)
+        if match is None:
+            return None
+        field = "orelse" if match["keyword"] == "else" else "finalbody"
+        indent = len(match["indent"])
+        owner = None
+        for entry in self.nodes:
+            node = entry[0]
+            body = getattr(node, field, ())
+            if node.col_offset == indent and body and node.lineno < line <= body[0].lineno:
+                if owner is None or node.lineno >= owner[0].lineno:
+                    owner = entry
+        return owner
 
     def is_header_line(self, node, line):
         """True if line is in node's own text (not in a nested body)."""

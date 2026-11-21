@@ -17,3 +17,9 @@ Everything comes from sqlglot at the pinned commit `eb11aec4`. No sample answers
    - recognise syntax errors (the module can't import, so all tests),
    - map every edited line to its whole enclosing statement (or the enclosing block for inserted
      statements) before looking up coverage.
+5. `record_tpcds_types.py` runs the real TPC-DS integration test, including
+   its worker processes, against the pinned checkout with `requirements.lock`.
+   It saves the observed operand types and equality dispatch in
+   `tpcds_types.json`. The selector can use these facts when the sole edit
+   replaces `value is None` with `value == None`. Other edits follow the
+   normal coverage and TPC-DS checks.
