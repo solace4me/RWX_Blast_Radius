@@ -3,6 +3,30 @@ ROOT=os.path.expanduser('~/sqlglot'); KIT=os.path.expanduser('~/mnt/RWX_Blast_Ra
 tests=json.load(open(f'{KIT}/sample/tests.json'))['tests']
 num={t['id']:t['number'] for t in tests}
 lines=collections.defaultdict(lambda: collections.defaultdict(set))  # file->line->tests
+# lines that run just by importing sqlglot modules: when a test module's import or a
+# class setup triggers them, that's the lazy import, which the import probe covers
+IMPORT_LINES=collections.defaultdict(set)
+for _p in ('~/importlines.json','~/importlines13.json'):
+    if os.path.exists(os.path.expanduser(_p)):
+        for _f,_v in json.load(open(os.path.expanduser(_p))).items(): IMPORT_LINES[_f].update(_v)
+_prefix_cache={}
+def ctx_tests(c):
+    """Coverage context -> test numbers. A test's own run -> itself; its setup or
+    teardown (setUpClass, fixtures) -> every test in its class; importing a test
+    module during collection -> every test under that node."""
+    if c in num: return {num[c]}
+    if c in _prefix_cache: return _prefix_cache[c]
+    out=None
+    if c.endswith('|setup') or c.endswith('|teardown'):
+        tid=c.rsplit('|',1)[0]
+        parts=tid.split('::')
+        prefix='::'.join(parts[:-1])+'::' if len(parts)>2 else parts[0]+'::'
+        out={n for i,n in num.items() if i.startswith(prefix)} or None
+    elif c.startswith('collect:'):
+        node=c[len('collect:'):]
+        out={n for i,n in num.items() if i==node or i.startswith(node+'::')} or None
+    _prefix_cache[c]=out
+    return out
 unmatched=set(); opened=collections.defaultdict(set)
 for d in glob.glob(os.path.expanduser(os.environ.get('BR_GLOB','~/brout_*'))):
     data=coverage.CoverageData(basename=os.path.join(d,'.coverage')); data.read()
@@ -10,14 +34,22 @@ for d in glob.glob(os.path.expanduser(os.environ.get('BR_GLOB','~/brout_*'))):
         rel=os.path.relpath(f,ROOT)
         for ln,ctxs in data.contexts_by_lineno(f).items():
             for c in ctxs:
-                if c in num: lines[rel][ln].add(num[c])
-                elif c=='' : lines[rel][ln].add(-1)
+                if c=='': lines[rel][ln].add(-1); continue
+                if (c.startswith('collect:') or '|' in c) and ln in IMPORT_LINES.get(rel,()):
+                    continue
+                ts=ctx_tests(c)
+                if ts: lines[rel][ln].update(ts)
+                elif c.startswith('collect:') or '|' in c: lines[rel][ln].add(-1)  # unknown scope: treat as import-time
                 else: unmatched.add(c)
     op=os.path.join(d,'opened.json')
     if os.path.exists(op):
         for k,v in json.load(open(op)).items():
-            if k in num:
-                for p in v: opened[p].add(num[k])
+            ts=ctx_tests(k)
+            if ts:
+                for p in v:
+                    if '__pycache__' in p or (k.startswith('collect:') and p.endswith('.py')):
+                        continue  # pytest reading test sources to rewrite asserts
+                    opened[p].update(ts)
             else: unmatched.add(k)
 print('files',len(lines),'unmatched ctx',len(unmatched),list(unmatched)[:5])
 covered={n for f in lines.values() for s in f.values() for n in s}

@@ -54,13 +54,40 @@ def pytest_sessionstart(session):
     io.open = _open
     _cov.start()
 
+def _ctx(name):
+    _current[0] = name
+    _cov.switch_context(name or "")
+
+
 @pytest.hookimpl(hookwrapper=True)
-def pytest_runtest_protocol(item, nextitem):
-    _current[0] = item.nodeid
-    _cov.switch_context(item.nodeid)
+def pytest_make_collect_report(collector):
+    # importing a test module (and its module-level code) -> all its tests
+    _ctx("collect:" + collector.nodeid if collector.nodeid else None)
     yield
-    _cov.switch_context("")
-    _current[0] = None
+    _ctx(None)
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_setup(item):
+    # setUpClass / fixtures run here -> every test in the class
+    _ctx(item.nodeid + "|setup")
+    yield
+    _ctx(None)
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_call(item):
+    _ctx(item.nodeid)
+    yield
+    _ctx(None)
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_teardown(item, nextitem):
+    _ctx(item.nodeid + "|teardown")
+    yield
+    _ctx(None)
+
 
 def pytest_sessionfinish(session, exitstatus):
     _cov.stop()

@@ -34,6 +34,10 @@ from pathlib import Path
 DATA = Path("/data")
 MAP_PATH = Path(__file__).with_name("map.json.gz")
 SRC_PATH = Path(__file__).with_name("sqlglot_src.tgz")
+TPCDS_PROBE = Path(__file__).with_name("tpcds_probe.py")
+TPCDS_INPUTS = Path(__file__).with_name("tpcds_inputs.json")
+TPCDS_BASE = Path(__file__).with_name("tpcds_base.json")  # written at image build
+TPCDS_ID = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
 WORKER_COST_MS = 2000
 MAX_WORKERS = 8
 FAMILIES = ("dialects", "parsers", "generators", "typing", "tokenizers")
@@ -72,6 +76,13 @@ class Selector:
         self.children = m["children"]
         self.bodies = m["bodies"]
         self.body_starts = {f: [r[0] for r in rs] for f, rs in self.bodies.items()}
+        self.tpcds_exec = {}
+        for f, rs in m.get("tpcds_exec", {}).items():
+            st = set()
+            for a, b in rs:
+                st.update(range(a, b + 1))
+            self.tpcds_exec[f] = st
+        self.tpcds = {t["number"] for t in tests if t["id"] == TPCDS_ID}
         self.import_lines = {}
         for f, rs in m.get("importlines", {}).items():
             st = set()
@@ -247,7 +258,13 @@ class Selector:
             return set(self.all), ["unparsed patch -> all"]
         patched = {}  # sqlglot files whose code changed -> new text (None = gone)
         import_modules = set()
+        runtime_lines = {}  # file -> old lines of runtime-only changes
+        tpcds_ok = True  # every change is a runtime change in sqlglot/*.py
         for e in entries:
+            if not (e.path.startswith("sqlglot/") and e.path.endswith(".py")) or (
+                e.binary or e.deleted or e.renamed or e.added or not e.hunks
+            ):
+                tpcds_ok = False
             if e.binary:
                 f = e.path
                 if f.startswith(IGNORED_PREFIXES) or f.endswith(IGNORED_SUFFIXES):
@@ -280,6 +297,10 @@ class Selector:
                 if kind == "noop":
                     notes.append(f"comment-only {f}")
                     continue
+                if kind == "code" and regions is not None and all(k == "runtime" for k, _ in regions):
+                    runtime_lines.setdefault(f, set()).update(*(x for _, x in regions))
+                else:
+                    tpcds_ok = False
                 if kind == "syntax":
                     sel |= self.all
                     notes.append(f"syntax error {f} -> all")
@@ -314,6 +335,31 @@ class Selector:
                 notes.append("import raises -> all")
             else:
                 notes.append("imports ok")
+        if (
+            tpcds_ok
+            and not import_modules
+            and self.tpcds
+            and self.tpcds <= sel
+            and patched
+            and runtime_lines
+        ):
+            touched = [
+                f for f, ls in runtime_lines.items()
+                if ls & self.tpcds_exec.get(f, set()) or ls & self.import_lines.get(f, set())
+            ]
+            if touched:
+                notes.append("tpcds: executor-side lines changed, keep")
+            else:
+                try:
+                    same = tpcds_inputs_unchanged(patched)
+                except Exception as ex:
+                    same = False
+                    notes.append(f"tpcds probe failed {ex!r}")
+                if same:
+                    sel = sel - self.tpcds
+                    notes.append("tpcds: identical inputs and executor code -> dropped")
+                else:
+                    notes.append("tpcds: inputs differ, keep")
         return sel, notes
 
     def modules_to_import(self, f):
@@ -323,6 +369,10 @@ class Selector:
             for n in self.family(parts[2][:-3]):
                 for fam in FAMILIES:
                     mods.add(f"sqlglot.{fam}.{n}")
+        else:
+            # core code (tokens, parser, generator, expressions...) is subclassed
+            # by every dialect: class creation can fail anywhere, so load it all
+            mods.add("ALL")
         mods.add("sqlglot")
         return mods
 
@@ -366,8 +416,17 @@ class Overlay:
 
 sys.meta_path.insert(0, Overlay())
 sys.path.insert(0, base)
+names = sys.argv[3:]
+if "ALL" in names:
+    import pkgutil
+    import sqlglot
+
+    names = [n for n in names if n != "ALL"] + [
+        i.name for i in pkgutil.walk_packages(sqlglot.__path__, prefix="sqlglot.")
+        if i.name != "sqlglot.__main__"
+    ]
 bad = []
-for name in sys.argv[3:]:
+for name in names:
     try:
         importlib.import_module(name)
     except ModuleNotFoundError as e:
@@ -426,6 +485,45 @@ def imports_break(patched, modules):
             cwd="/tmp", capture_output=True, text=True, timeout=60,
         )
         return not (r.returncode == 0 and r.stdout.strip() == "OK")
+    finally:
+        shutil.rmtree(overlay, ignore_errors=True)
+
+
+TPCDS_RUN = "import sys\nsys.path[:] = [p for p in sys.path if p not in ('', '.')]\n" + IMPORT_CHECK.split("sys.meta_path.insert(0, Overlay())")[0] + """
+sys.meta_path.insert(0, Overlay())
+sys.path.insert(0, base)
+import runpy
+probe = sys.argv[3]
+sys.argv = [probe] + sys.argv[4:]
+runpy.run_path(probe, run_name="__main__")
+"""
+
+
+def tpcds_inputs_unchanged(patched):
+    """Run tpcds_probe.py on the patched tree and compare with the pinned
+    commit's fingerprints. Any doubt (missing files, errors) -> False."""
+    if not (TPCDS_BASE.exists() and TPCDS_PROBE.exists() and TPCDS_INPUTS.exists()):
+        return False
+    base = base_tree()
+    _PROBES[0] += 1
+    overlay = Path(f"/tmp/br_overlay_{os.getpid()}_{_PROBES[0]}")
+    shutil.rmtree(overlay, ignore_errors=True)
+    try:
+        for rel, text in patched.items():
+            if text is None:
+                return False
+            target = overlay / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(text, "utf-8")
+        env = {"PYTHONHASHSEED": "0", "PATH": os.environ.get("PATH", "")}
+        r = subprocess.run(
+            # not -I: that would ignore PYTHONHASHSEED; the env is minimal and
+            # the script drops the working directory from sys.path itself
+            [sys.executable, "-s", "-B", "-c", TPCDS_RUN, str(base), str(overlay),
+             str(TPCDS_PROBE), str(TPCDS_INPUTS), str(TPCDS_BASE)],
+            cwd="/tmp", env=env, capture_output=True, text=True, timeout=120,
+        )
+        return r.returncode == 0 and r.stdout.strip() == "SAME"
     finally:
         shutil.rmtree(overlay, ignore_errors=True)
 
