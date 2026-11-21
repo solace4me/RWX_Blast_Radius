@@ -34,10 +34,12 @@ from pathlib import Path
 
 from setting_index import SettingIndex, edited_setting
 from tpcds_query_index import QueryIndex
+from dictkey_index import DictKeyIndex
 
 DATA = Path("/data")
 MAP_PATH = Path(__file__).with_name("map.json.gz")
 SETTING_READS = Path(__file__).with_name("setting_reads.json.gz")
+DICT_KEYS = Path(__file__).with_name("dict_keys.json.gz")
 SRC_PATH = Path(__file__).with_name("sqlglot_src.tgz")
 TPCDS_PROBE = Path(__file__).with_name("tpcds_probe.py")
 TPCDS_INPUTS = Path(__file__).with_name("tpcds_inputs.json")
@@ -45,6 +47,7 @@ TPCDS_BASE = Path(__file__).with_name("tpcds_base.json")  # written at image bui
 TPCDS_TYPES = Path(__file__).with_name("tpcds_types.json")
 TPCDS_QUERY_LINES = Path(__file__).with_name("tpcds_query_lines.json.gz")
 TPCDS_ID = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+TPCDS_SCREEN_MIN_QUERY = 8
 WORKER_COST_MS = 2000
 MAX_WORKERS = 8
 FAMILIES = ("dialects", "parsers", "generators", "typing", "tokenizers")
@@ -96,6 +99,12 @@ class Selector:
         self.tpcds_types = {}
         if self.tpcds and TPCDS_TYPES.is_file():
             self.tpcds_types = json.loads(TPCDS_TYPES.read_text("utf-8"))
+        self.dict_index = None
+        if DICT_KEYS.is_file():
+            try:
+                self.dict_index = DictKeyIndex.load(DICT_KEYS, tests)
+            except (AttributeError, EOFError, KeyError, OSError, TypeError, ValueError, zlib.error) as ex:
+                log("dict key map disabled:", repr(ex))
         self.setting_index = None
         if SETTING_READS.is_file():
             try:
@@ -387,6 +396,17 @@ class Selector:
                             if len(narrowed) < len(sel):
                                 notes.append(f"setting reads: {len(sel)} -> {len(narrowed)}")
                                 sel = narrowed
+                if len(entries) == 1 and self.dict_index:
+                    f = entries[0].path
+                    before = original_source(f)
+                    if f in patched and before is not None:
+                        narrowed = self.dict_index.narrow(f, before, patched[f], sel)
+                        if narrowed is not None:
+                            # tests outside the recording keep the normal treatment
+                            narrowed |= set(self.opened.get(f, ())) | (sel & self.blind)
+                            if len(narrowed) < len(sel):
+                                notes.append(f"dict key reads: {len(sel)} -> {len(narrowed)}")
+                                sel = narrowed
         if (
             tpcds_ok
             and not tpcds_import_blocked
@@ -412,16 +432,12 @@ class Selector:
                 notes.append("tpcds: executor-side lines changed, keep")
             else:
                 try:
-                    # only runtime edits have line evidence; class-body edits replay everything
-                    queries = (
-                        self.tpcds_queries.affected_queries(runtime_lines)
-                        if self.tpcds_queries and not tpcds_import_files else None
-                    )
-                    first = queries[0] if queries else None
+                    queries = self.tpcds_queries.affected_queries(runtime_lines) if self.tpcds_queries else None
+                    screen = queries[:1] if queries and queries[0] >= TPCDS_SCREEN_MIN_QUERY else ()
                     preload = sorted(
                         f[:-3].replace("/", ".") for f in tpcds_import_files
                     )
-                    same = tpcds_inputs_unchanged(patched, first, preload)
+                    same = tpcds_inputs_unchanged(patched, screen, preload)
                 except Exception as ex:
                     same = False
                     notes.append(f"tpcds probe failed {ex!r}")
@@ -628,20 +644,24 @@ runpy.run_path(probe, run_name="__main__")
 """
 
 
-def check_tpcds_inputs(command, env, first_affected=None):
-    """SAME/DIFF over the TPC-DS queries. Queries before the first one whose
-    processing ran any changed line can't differ: up to that point the patched
-    run executes exactly the pinned code on the same inputs. So the comparison
-    starts there. Starting without those queries' leftover state can only
-    produce spurious differences (keeping the test), never hide one."""
+def check_tpcds_inputs(command, env, screen):
     runtime = dict(cwd="/tmp", env=env, capture_output=True, text=True)
-    if first_affected:
-        command = [*command, "--from", str(first_affected)]
+    if screen:
+        subset = [*command, "--queries", ",".join(map(str, screen))]
+        try:
+            probe = subprocess.run(subset, timeout=2, **runtime)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        else:
+            if probe.returncode == 0 and probe.stdout.strip() == "DIFF":
+                return False
+    # A matching subset supplies no evidence about the remaining queries or
+    # their shared state. Make the removal decision in a fresh ordered run.
     probe = subprocess.run(command, timeout=120, **runtime)
     return probe.returncode == 0 and probe.stdout.strip() == "SAME"
 
 
-def tpcds_inputs_unchanged(patched, first_affected=None, preload=()):
+def tpcds_inputs_unchanged(patched, screen=(), preload=()):
     """Run tpcds_probe.py on the patched tree and compare with the pinned
     commit's fingerprints. Any doubt (missing files, errors) -> False."""
     if not (TPCDS_BASE.exists() and TPCDS_PROBE.exists() and TPCDS_INPUTS.exists()):
@@ -663,7 +683,7 @@ def tpcds_inputs_unchanged(patched, first_affected=None, preload=()):
         # from sys.path explicitly.
         command = [sys.executable, "-s", "-B", "-c", TPCDS_RUN, str(base), str(overlay),
                    str(TPCDS_PROBE), str(TPCDS_INPUTS), str(TPCDS_BASE)]
-        return check_tpcds_inputs(command, env, first_affected)
+        return check_tpcds_inputs(command, env, screen)
     finally:
         shutil.rmtree(overlay, ignore_errors=True)
 

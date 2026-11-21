@@ -47,3 +47,20 @@ PYTHONPATH="$KIT:$KIT/tools:${PYTHONPATH:-}" SKIP_INTEGRATION=0 \
 PYTHONPATH="$KIT:${PYTHONPATH:-}" python -B "$KIT/tools/record_settings.py" \
   "$TRACE" "$KIT/sample/tests.json" "$KIT/setting_reads.json.gz"
 ```
+8. `record_dictkeys.py` (pytest plugin + merger) records which tests read the
+   value under each key of every class-level literal dict setting in the
+   dialect modules, nested classes included (e.g. `Snowflake.Tokenizer.NUMERIC_ESCAPES`).
+   The dicts are wrapped while each module is compiled, before anything can
+   read them. `d[k]` and `d.get(k)` count for key `k`; membership, `len` and
+   truthiness are ignored, since a value-only edit can't change them. Any
+   other use counts as reading every key. A read during a module import or
+   class creation (sqlglot loads dialects lazily, so this can happen inside a
+   test), outside a test, or on another thread blocks that key, or the whole
+   setting. The selector narrows only an edit to one value under one existing
+   key, after the import check passes; tests outside the recording keep the
+   normal selection.
+
+```sh
+SKIP_INTEGRATION=0 BR_DICT_OUT=$TRACE PYTHONPATH="$KIT/tools:$PWD" python -B -m pytest -p record_dictkeys -q tests
+python "$KIT/tools/record_dictkeys.py" "$TRACE" "$KIT/sample/tests.json" "$PWD" "$KIT/dict_keys.json.gz"
+```

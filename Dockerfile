@@ -13,5 +13,6 @@ RUN mkdir -p /app/src \
  && python -c "import json; assert len(json.load(open('/app/tpcds_base.json'))) == 99" \
  && chmod -R a+rX /app
 COPY selector.py map.json.gz tpcds_types.json setting_index.py setting_reads.json.gz \
-     tpcds_query_index.py tpcds_query_lines.json.gz /app/
+     tpcds_query_index.py tpcds_query_lines.json.gz dictkey_index.py dict_keys.json.gz /app/
+RUN chmod -R a+rX /app
 CMD ["python", "/app/selector.py"]
