@@ -74,8 +74,6 @@ class Selector:
         # dialect name -> tests that used it at run time (through inheritance
         # or lookups by name such as Dialect["teradata"])
         self.uses = {k: set(v) for k, v in m.get("uses", {}).items()}
-        # class name -> tests that created an instance of it or of a subclass
-        self.inst = {k: set(v) for k, v in m.get("inst", {}).items()}
         self.children = m["children"]
         self.bodies = m["bodies"]
         self.body_starts = {f: [r[0] for r in rs] for f, rs in self.bodies.items()}
@@ -153,10 +151,6 @@ class Selector:
             for n in self.family(name):
                 sel |= self.mention.get(n, set())
                 sel |= self.uses.get(n, set())
-        for c in classes:
-            # a class-level edit (arg_types, settings...) matters to whoever
-            # builds instances of that class
-            sel |= self.inst.get(c, set())
         if not self.generator_related(f, classes):
             # test_generator_memory only measures memory retained by
             # repeatedly creating each dialect's Generator
@@ -831,14 +825,13 @@ def change_regions(old, new, hunks):
     parents_new_map = {id(x[0]): x for x in new_idx.nodes}
 
     def classes_of(entry, pmap):
-        """Qualified name of the innermost enclosing class, e.g. 'Snowflake.Tokenizer'."""
-        chain = []
+        names = set()
         cur = entry
         while cur is not None:
             if isinstance(cur[0], ast.ClassDef):
-                chain.append(cur[0].name)
+                names.add(cur[0].name)
             cur = pmap.get(id(cur[1])) if cur[1] is not None else None
-        return frozenset({".".join(reversed(chain))} if chain else {"?"})
+        return frozenset(names)
 
     def old_entry_at(old_line, like):
         """The old statement starting at old_line of the same type as `like`."""
