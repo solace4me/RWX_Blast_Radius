@@ -83,6 +83,9 @@ class Selector:
         seen = set().union(*self.file_tests.values(), *self.opened.values())
         self.blind = self.all - seen
         self.test_id = {t["number"]: t["id"] for t in tests}
+        self.generator_memory = {
+            n for n, tid in self.test_id.items() if tid.endswith("::test_generator_memory")
+        }
 
     def in_body(self, f, ln):
         starts = self.body_starts.get(f)
@@ -125,7 +128,7 @@ class Selector:
             out.add(n)  # anything unknown: keep
         return out
 
-    def import_time_fallback(self, f):
+    def import_time_fallback(self, f, classes=frozenset({"?"})):
         sel = set(self.file_tests[f]) | self.blind_for(f, True)
         parts = f.split("/")
         name = parts[2][:-3] if len(parts) == 3 else None
@@ -133,29 +136,49 @@ class Selector:
             for n in self.family(name):
                 sel |= self.mention.get(n, set())
                 sel |= self.uses.get(n, set())
+        if not self.generator_related(f, classes):
+            # test_generator_memory only measures memory retained by
+            # repeatedly creating each dialect's Generator
+            sel -= self.generator_memory
         return sel
 
     def select_regions(self, f, regions):
-        """regions: list of ('import', None) or ('runtime', set_of_old_lines)."""
+        """regions: list of ('import', class_names) or ('runtime', old_lines)."""
         d = self.lines.get(f)
         if d is None:
             return self.all, f"unmapped {f} -> all"
         imports = self.import_lines.get(f, set())
         sel = set()
         import_time = False
-        for kind, lines in regions:
-            if kind == "import" or lines & imports:
+        classes = set()
+        for kind, info in regions:
+            if kind == "import":
                 import_time = True
+                classes |= set(info or {"?"})
                 continue
-            for ln in lines:
+            if info & imports:
+                import_time = True
+                classes.add("?")  # module-level code calls this: unknown scope
+                continue
+            for ln in info:
                 s = d.get(ln)
                 if s:
                     if -1 in s:
                         import_time = True
+                        classes.add("?")
                     sel.update(n for n in s if n >= 0)
         if import_time:
-            return sel | self.import_time_fallback(f), f"import-time* {f}"
+            return sel | self.import_time_fallback(f, classes), f"import-time* {f}"
         return sel | self.blind_for(f, False), f"statement-level {f} ({len(regions)} regions)"
+
+    def generator_related(self, f, classes):
+        """Could this import-time change alter what creating a Generator allocates?"""
+        if f.startswith("sqlglot/generators/") or f in (
+            "sqlglot/generator.py",
+            "sqlglot/dialects/dialect.py",
+        ):
+            return True
+        return any(c == "?" or "Generator" in c for c in classes)
 
     def select_file(self, f, changed):
         if f.startswith("tests/"):
@@ -321,64 +344,90 @@ def original_source(path):
 
 _BASE = None
 IMPORT_CHECK = """
-import importlib, sys
-sys.path.insert(0, sys.argv[1])
+import importlib, importlib.util, importlib.machinery, os, sys
+base, overlay = sys.argv[1], sys.argv[2]
+
+
+class Overlay:
+    # serves patched modules from `overlay`; everything else comes from `base`
+    def find_spec(self, fullname, path=None, target=None):
+        rel = fullname.replace(".", "/")
+        for cand, pkg in ((rel + ".py", False), (rel + "/__init__.py", True)):
+            f = os.path.join(overlay, cand)
+            if os.path.exists(f + ".deleted"):
+                raise ModuleNotFoundError(fullname, name=fullname)
+            if os.path.exists(f):
+                locs = [os.path.join(base, rel)] if pkg else None
+                return importlib.util.spec_from_file_location(
+                    fullname, f, submodule_search_locations=locs
+                )
+        return None
+
+
+sys.meta_path.insert(0, Overlay())
+sys.path.insert(0, base)
 bad = []
-for name in sys.argv[2:]:
+for name in sys.argv[3:]:
     try:
         importlib.import_module(name)
     except ModuleNotFoundError as e:
-        if e.name and name.startswith(e.name):
+        if e.name and name.startswith(e.name) and not os.path.exists(
+            os.path.join(overlay, e.name.replace(".", "/") + ".py.deleted")
+        ):
             continue  # module doesn't exist in this family
         bad.append(name)
     except BaseException:
         bad.append(name)
 print("BAD" if bad else "OK")
 """
+SRC_TREE = Path(__file__).with_name("src")  # built into the image, with checked-hash .pyc
 
 
 def base_tree():
-    """Extract pinned sqlglot sources once into /tmp (no bytecode anywhere)."""
+    """Pinned sqlglot sources. The image ships them precompiled with
+    checked-hash bytecode (validated against the source on every import);
+    otherwise extract them into /tmp."""
     global _BASE
     if _BASE is None:
-        root = Path("/tmp/br_src")
-        if root.exists():
-            shutil.rmtree(root, ignore_errors=True)
-        with tarfile.open(SRC_PATH, "r:gz") as tar:
-            tar.extractall(root, filter="data")
-        _BASE = root
+        if (SRC_TREE / "sqlglot" / "__init__.py").exists():
+            _BASE = SRC_TREE
+        else:
+            root = Path("/tmp/br_src")
+            if root.exists():
+                shutil.rmtree(root, ignore_errors=True)
+            with tarfile.open(SRC_PATH, "r:gz") as tar:
+                tar.extractall(root, filter="data")
+            _BASE = root
     return _BASE
 
 
+_PROBES = [0]
+
+
 def imports_break(patched, modules):
-    """Write the patched files over the pinned tree (None = delete), import
-    `modules` in a fresh interpreter that never reads or writes bytecode,
-    then restore the tree. True unless the probe exits 0 and prints OK."""
-    root = base_tree()
-    originals = {}
+    """Import `modules` in a fresh interpreter where the patched files (None =
+    deleted) shadow the pinned tree. The patched files live in a new overlay
+    directory and are never compiled to disk (-B). True unless the probe
+    exits 0 and prints exactly OK."""
+    base = base_tree()
+    _PROBES[0] += 1
+    overlay = Path(f"/tmp/br_overlay_{os.getpid()}_{_PROBES[0]}")
+    shutil.rmtree(overlay, ignore_errors=True)
     try:
         for rel, text in patched.items():
-            target = root / rel
-            originals[rel] = target.read_text("utf-8") if target.exists() else None
+            target = overlay / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
             if text is None:
-                target.unlink(missing_ok=True)
+                (overlay / (rel + ".deleted")).write_text("")
             else:
-                target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(text, "utf-8")
-        # -B: never write bytecode; the tree is freshly extracted, so none exists
         r = subprocess.run(
-            [sys.executable, "-I", "-B", "-c", IMPORT_CHECK, str(root), *modules],
-            cwd=str(root), capture_output=True, text=True, timeout=60,
+            [sys.executable, "-I", "-B", "-c", IMPORT_CHECK, str(base), str(overlay), *modules],
+            cwd="/tmp", capture_output=True, text=True, timeout=60,
         )
         return not (r.returncode == 0 and r.stdout.strip() == "OK")
     finally:
-        for rel, text in originals.items():
-            target = root / rel
-            if text is None:
-                target.unlink(missing_ok=True)
-            else:
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(text, "utf-8")
+        shutil.rmtree(overlay, ignore_errors=True)
 
 
 class FileDiff:
@@ -566,7 +615,7 @@ def analyse_source_change(path, hunks):
     except (tokenize.TokenError, SyntaxError, IndentationError):
         return None, None, new
     if coding_changed:
-        return "code", [("import", None)], new
+        return "code", [("import", frozenset({"?"}))], new
     try:
         return "code", change_regions(old, new, hunks), new
     except Exception:
@@ -613,6 +662,18 @@ def change_regions(old, new, hunks):
         end = (b - 1) if b is not None else node.end_lineno
         return set(range(StmtIndex.first_line(node), end + 1))
 
+    parents_old_map = {id(x[0]): x for x in old_idx.nodes}
+    parents_new_map = {id(x[0]): x for x in new_idx.nodes}
+
+    def classes_of(entry, pmap):
+        names = set()
+        cur = entry
+        while cur is not None:
+            if isinstance(cur[0], ast.ClassDef):
+                names.add(cur[0].name)
+            cur = pmap.get(id(cur[1])) if cur[1] is not None else None
+        return frozenset(names)
+
     def old_entry_at(old_line, like):
         """The old statement starting at old_line of the same type as `like`."""
         for e in old_idx.nodes:
@@ -628,7 +689,7 @@ def change_regions(old, new, hunks):
         if not old_idx.is_header_line(node, L):
             continue  # comment/blank line between statements
         if not in_func:
-            regions.append(("import", None))
+            regions.append(("import", classes_of(e, parents_old_map)))
         else:
             regions.append(("runtime", header_lines(old_idx, node)))
 
@@ -641,7 +702,7 @@ def change_regions(old, new, hunks):
         if not new_idx.is_header_line(node, N):
             continue
         if not in_func:
-            regions.append(("import", None))
+            regions.append(("import", classes_of(e, parents_new_map)))
             continue
         # climb to the nearest statement that also exists in the old file
         cur = e
@@ -658,19 +719,22 @@ def change_regions(old, new, hunks):
             first = False
             cur = parents_new.get(id(cparent)) if cparent is not None else None
         if found is None:
-            regions.append(("import", None))
+            regions.append(("import", classes_of(e, parents_new_map)))
             continue
         (onode, oparent, oin), same_stmt = found
         if same_stmt:
             # an existing statement was edited in place
-            regions.append(("runtime" if oin else "import", header_lines(old_idx, onode) if oin else None))
+            if oin:
+                regions.append(("runtime", header_lines(old_idx, onode)))
+            else:
+                regions.append(("import", classes_of(found[0], parents_old_map)))
         elif isinstance(onode, (ast.FunctionDef, ast.AsyncFunctionDef)):
             b = old_idx.body_start(onode)
             regions.append(("runtime", set(range(b, onode.end_lineno + 1))))
         elif oin:
             regions.append(("runtime", header_lines(old_idx, onode)))
         else:
-            regions.append(("import", None))
+            regions.append(("import", classes_of(found[0], parents_old_map)))
     return regions
 
 
