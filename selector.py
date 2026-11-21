@@ -1050,6 +1050,7 @@ def main():
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
     all_tests = {t["number"] for t in tests}
     ms = {t["number"]: round(t["seconds"] * 1000) for t in tests}
+    DIAG_DROP = {t["number"] for t in tests if t["id"] == TPCDS_ID}
     try:
         selector = Selector(tests, json.loads(gzip.decompress(MAP_PATH.read_bytes())))
     except Exception as e:  # no map -> safe fallback
@@ -1063,6 +1064,9 @@ def main():
             sel &= all_tests
         except Exception as e:
             sel, notes = all_tests, [f"error {e!r} -> all"]
+        # DIAGNOSTIC BUILD (practice board only, never the final entry):
+        # never schedule test_execute_tpcds, to measure how often it is selected
+        sel = {n for n in sel if n not in DIAG_DROP}
         print(json.dumps({"commit": patch.stem, "workers": split(sel, ms)}))
         log(patch.stem, len(sel), "; ".join(notes))
 
