@@ -5,8 +5,9 @@ process, and (for queries marked execute) optimizes it against TPCDS_SCHEMA,
 builds a Plan and runs the plan in PythonExecutor; the expected result comes
 from DuckDB running transpile(sql, write="duckdb").
 
-This prints one hash per query covering: the unpickled parse tree, the DuckDB
-transpilation, the tables found and the optimized tree. Planning and execution
+This prints one hash per query covering: whether parsing and pickling succeed
+and, for executed queries, the DuckDB transpilation, the tables found and the
+optimized tree (the only routes by which the parse tree reaches the executor). Planning and execution
 are covered separately: tools/tpcds_exec_lines.py records every line that runs
 from Plan(...) onwards. If all hashes match the pinned commit's and none of
 those lines changed, the test runs identical code on identical inputs.
@@ -103,7 +104,11 @@ def main(inputs_path, base_path=None, query_indices=None, *, on_query=None):
         try:
             tree = pickle.loads(pickle.dumps(parse_one(sql)))
             deep = Digest()
-            parts.append(deep(tree))
+            # The test only parses and pickles queries it doesn't execute, so for
+            # those only success or failure matters. For executed ones the tree
+            # reaches the executor solely through find_tables and optimize, which
+            # are fingerprinted below.
+            parts.append("parsed")
             if execute:
                 parts.append(transpile(sql, write="duckdb")[0])
                 parts.append(deep(sorted(t.name for t in find_tables(tree))))

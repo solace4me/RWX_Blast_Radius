@@ -284,6 +284,8 @@ class Selector:
         patched = {}  # sqlglot files whose code changed -> new text (None = gone)
         import_modules = set()
         runtime_lines = {}  # file -> old lines of runtime-only changes
+        tpcds_import_files = set()  # dialect files whose class bodies changed
+        tpcds_import_blocked = False  # an import-time change the tpcds check can't vouch for
         tpcds_ok = True  # every change is a runtime change in sqlglot/*.py
         for e in entries:
             if not (e.path.startswith("sqlglot/") and e.path.endswith(".py")) or (
@@ -326,6 +328,14 @@ class Selector:
                     continue
                 if kind == "code" and regions is not None and all(k == "runtime" for k, _ in regions):
                     runtime_lines.setdefault(f, set()).update(*(x for _, x in regions))
+                elif kind == "code" and regions is not None and self.tpcds_import_allowed(f):
+                    # class-body edits in a SQL dialect the executor never uses:
+                    # the probe preloads the patched module, so any effect on
+                    # parsing, optimizing or the DuckDB side shows up as DIFF
+                    runtime_lines.setdefault(f, set()).update(
+                        *(x for k, x in regions if k == "runtime")
+                    )
+                    tpcds_import_files.add(f)
                 else:
                     tpcds_ok = False
                 if kind == "syntax":
@@ -340,6 +350,8 @@ class Selector:
                     notes.append(note)
                     if note.startswith("import-time"):
                         import_modules |= self.modules_to_import(f)
+                        if f not in tpcds_import_files:
+                            tpcds_import_blocked = True
                     continue
                 if kind is None:
                     # the patch doesn't apply to our copy: be safe
@@ -348,6 +360,7 @@ class Selector:
                     continue
                 if f in self.lines:
                     import_modules |= self.modules_to_import(f)
+                    tpcds_import_blocked = True
             s, note = self.select_file(f, changed)
             sel |= s
             notes.append(note)
@@ -377,12 +390,13 @@ class Selector:
                                 sel = narrowed
         if (
             tpcds_ok
-            and not import_modules
+            and not tpcds_import_blocked
+            and not any("import raises" in n for n in notes)
             and self.tpcds
             and self.tpcds <= sel
             and sel != self.all
             and patched
-            and runtime_lines
+            and (any(runtime_lines.values()) or tpcds_import_files)
         ):
             if len(entries) == 1:
                 f = entries[0].path
@@ -401,7 +415,10 @@ class Selector:
                 try:
                     queries = self.tpcds_queries.affected_queries(runtime_lines) if self.tpcds_queries else None
                     screen = queries[:1] if queries and queries[0] >= TPCDS_SCREEN_MIN_QUERY else ()
-                    same = tpcds_inputs_unchanged(patched, screen)
+                    preload = sorted(
+                        f[:-3].replace("/", ".") for f in tpcds_import_files
+                    )
+                    same = tpcds_inputs_unchanged(patched, screen, preload)
                 except Exception as ex:
                     same = False
                     notes.append(f"tpcds probe failed {ex!r}")
@@ -411,6 +428,19 @@ class Selector:
                 else:
                     notes.append("tpcds: inputs differ, keep")
         return sel, notes
+
+    def tpcds_import_allowed(self, f):
+        """A SQL dialect's own file (dialects/parsers/generators/typing/tokenizers
+        <name>.py). The TPC-DS executor runs on the Python dialect and the base
+        classes, so these only reach it through parsing, optimizing and the
+        DuckDB transpile, all of which the probe fingerprints."""
+        parts = f.split("/")
+        if len(parts) != 3 or parts[0] != "sqlglot" or parts[1] not in FAMILIES:
+            return False
+        name = parts[2][:-3]
+        if name in ("__init__", "dialect", "base", "python"):
+            return False
+        return "python" not in self.family(name)
 
     def modules_to_import(self, f):
         mods = {f[:-3].replace("/", ".").removesuffix(".__init__")}
@@ -586,7 +616,9 @@ def imports_break(patched, modules):
 TPCDS_RUN = "import sys\nsys.path[:] = [p for p in sys.path if p not in ('', '.')]\n" + IMPORT_CHECK.split("sys.meta_path.insert(0, Overlay())")[0] + """
 sys.meta_path.insert(0, Overlay())
 sys.path.insert(0, base)
-import runpy
+import importlib, runpy
+for _name in filter(None, os.environ.get("BR_PRELOAD", "").split(",")):
+    importlib.import_module(_name)  # load patched dialect modules first; errors -> nonzero exit
 probe = sys.argv[3]
 sys.argv = [probe] + sys.argv[4:]
 runpy.run_path(probe, run_name="__main__")
@@ -610,7 +642,7 @@ def check_tpcds_inputs(command, env, screen):
     return probe.returncode == 0 and probe.stdout.strip() == "SAME"
 
 
-def tpcds_inputs_unchanged(patched, screen=()):
+def tpcds_inputs_unchanged(patched, screen=(), preload=()):
     """Run tpcds_probe.py on the patched tree and compare with the pinned
     commit's fingerprints. Any doubt (missing files, errors) -> False."""
     if not (TPCDS_BASE.exists() and TPCDS_PROBE.exists() and TPCDS_INPUTS.exists()):
@@ -626,7 +658,8 @@ def tpcds_inputs_unchanged(patched, screen=()):
             target = overlay / rel
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(text, "utf-8")
-        env = {"PYTHONHASHSEED": "0", "PATH": os.environ.get("PATH", "")}
+        env = {"PYTHONHASHSEED": "0", "PATH": os.environ.get("PATH", ""),
+               "BR_PRELOAD": ",".join(preload)}
         # -I would ignore PYTHONHASHSEED. TPCDS_RUN removes the working directory
         # from sys.path explicitly.
         command = [sys.executable, "-s", "-B", "-c", TPCDS_RUN, str(base), str(overlay),
