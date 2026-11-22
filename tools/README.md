@@ -72,10 +72,12 @@ python "$KIT/tools/record_dictkeys.py" "$TRACE" "$KIT/sample/tests.json" "$PWD" 
    every change is a validated edit to an existing Python source outside
    that import's dependencies.
 10. `record_comparisons.py` captures values and types observed at comparison
-    sites during passing tests. The selector evaluates a single operator or
-    literal change against those facts at runtime. Comparisons with
-    unsupported operands, shared setup, imports or unobserved workers keep
-    their normal selection.
+    sites during passing tests. Spawned optimizer tasks record argument
+    loading, function execution and result serialization under the submitting
+    test. A pool with missing task data keeps its tests selected. The selector
+    evaluates a single operator or literal change against the recorded
+    operands. Unsupported operands, shared setup, imports and unobserved work
+    keep the normal selection.
 11. `record_expr_validation.py` captures expression argument validation and
     metadata readers in the pinned suite. A single boolean change to an
     existing `arg_types` key can use this map after a successful import.

@@ -1,6 +1,10 @@
 import gzip
 import json
 from enum import Enum
+import os
+from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
@@ -48,6 +52,85 @@ def test_runtime_index_checks_source_and_catalog(tmp_path):
     index = index_for(tmp_path, BEFORE, after, [[pair(3, 10), [0]]])
     assert index.narrow(FILE, BEFORE + "# different source\n", after, {0}) is None
     assert index_for(tmp_path, BEFORE, after, [], catalog=CATALOG[:1]) is None
+
+
+def test_records_spawned_tasks_and_keeps_unobserved_worker_tests(tmp_path):
+    package = tmp_path / "sqlglot"
+    package.mkdir()
+    (package / "__init__.py").touch()
+    before = """\
+def check(value):
+    return value <= 10
+
+class Result:
+    def __reduce__(self):
+        return bool, (check(10),)
+
+def reject_boundary():
+    if check(10):
+        raise ValueError("boundary")
+"""
+    (package / "example.py").write_text(before, encoding="utf-8")
+    (tmp_path / "test_pool.py").write_text("""\
+from concurrent.futures import ProcessPoolExecutor
+from multiprocessing import get_context
+import os
+import pytest
+from sqlglot.example import Result, check, reject_boundary
+
+@pytest.fixture(scope="module")
+def shared():
+    with ProcessPoolExecutor(max_workers=1, mp_context=get_context("spawn")) as pool:
+        yield pool
+
+def test_safe(shared):
+    assert shared.submit(check, 3).result()
+
+def test_boundary(shared):
+    assert shared.submit(check, 10).result()
+
+def test_result_serialization(shared):
+    assert shared.submit(Result).result() is True
+
+def test_unknown():
+    assert check(3)
+    with ProcessPoolExecutor(max_workers=1, mp_context=get_context("spawn"),
+                             initializer=os.getpid) as pool:
+        assert pool.submit(check, 10).result()
+
+def test_main():
+    assert check(3)
+
+@pytest.fixture(scope="module")
+def incomplete():
+    with ProcessPoolExecutor(max_workers=1, mp_context=get_context("spawn")) as pool:
+        yield pool
+
+def test_incomplete_safe(incomplete):
+    assert incomplete.submit(check, 3).result()
+
+def test_incomplete_exception(incomplete):
+    with pytest.raises(ValueError, match="boundary"):
+        incomplete.submit(reject_boundary).result()
+""", encoding="utf-8")
+    names = ("safe", "boundary", "result_serialization", "unknown", "main",
+             "incomplete_safe", "incomplete_exception")
+    catalog = [{"id": f"test_pool.py::test_{name}", "number": n} for n, name in enumerate(names)]
+    tests = tmp_path / "tests.json"
+    tests.write_text(json.dumps({"tests": catalog}), encoding="utf-8")
+    output = tmp_path / "comparisons.json.gz"
+    repo = Path(__file__).resolve().parents[1]
+    recorded = subprocess.run(
+        [sys.executable, "-B", str(repo / "tools" / "record_comparisons.py"),
+         str(tests), str(output), "test_pool.py"],
+        cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": str(repo), "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1"},
+        capture_output=True, text=True, timeout=40,
+    )
+    assert recorded.returncode == 0, recorded.stdout + recorded.stderr
+    index = ComparisonIndex.load(output, catalog)
+    chosen = index.narrow(FILE, before, before.replace("<=", "<"), set(range(len(names))))
+    assert chosen == {1, 2, 3, 5, 6}
 
 
 def test_literal_replacement_propagates_through_a_tuple(tmp_path):

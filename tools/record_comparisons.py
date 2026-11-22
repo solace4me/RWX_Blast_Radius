@@ -6,7 +6,7 @@ to PYTHONPATH, set SKIP_INTEGRATION=0, and pass the test catalog and destination
     python -B "$KIT/tools/record_comparisons.py" "$KIT/sample/tests.json" \
         "$KIT/comparison_reads.json.gz" tests -k 'not test_max_nodes and not test_generator_memory'
 
-Excluded, failed, skipped, and worker tests are absent from the recording.
+Excluded, failed, skipped, and incompletely observed tests are absent from the recording.
 The trace touches only original imports and tests and takes no patch inputs.
 """
 
@@ -21,6 +21,7 @@ import importlib.machinery
 import json
 from pathlib import Path
 import sys
+import tempfile
 import threading
 import weakref
 
@@ -36,6 +37,7 @@ from compare_index import (
     source_digest,
 )
 from setting_index import catalog_digest
+from tools.comparison_pool import WorkerRecordings
 
 
 FIRST = "_br_comparison_left"
@@ -89,7 +91,7 @@ class Instrument(ast.NodeTransformer):
 
 
 class Recorder:
-    def __init__(self, root, catalog):
+    def __init__(self, root, catalog, workers=None):
         self.root = root
         self.catalog = {nodeid: index for index, nodeid in enumerate(sorted(catalog))}
         self.sites = {}
@@ -103,6 +105,7 @@ class Recorder:
         self.external = set()
         self.stages = {}
         self.results = {}
+        self.workers = workers
 
     def source_code(self, path):
         source = path.read_text("utf-8")
@@ -213,12 +216,15 @@ class Recorder:
         submit = ProcessPoolExecutor.submit
         start = threading.Thread.start
 
-        def tracked_submit(pool, *args, **kwargs):
+        def tracked_submit(pool, fn, /, *args, **kwargs):
+            if self.workers is not None:
+                return self.workers.submit(self, submit, pool, fn, args, kwargs)
             self.mark_external()
-            return submit(pool, *args, **kwargs)
+            return submit(pool, fn, *args, **kwargs)
 
         def tracked_start(thread, *args, **kwargs):
-            self.mark_external()
+            if self.workers is None or not self.workers.is_pool_thread(thread):
+                self.mark_external()
             return start(thread, *args, **kwargs)
 
         ProcessPoolExecutor.submit = tracked_submit
@@ -255,7 +261,35 @@ class Recorder:
         if report.passed and not hasattr(report, "wasxfail"):
             self.stages.setdefault(report.nodeid, set()).add(report.when)
 
+    def worker_report(self):
+        # A lazy import need not assign the same numbers in different workers.
+        blocked = {key for key, number in self.sites.items() if number in self.blocked}
+        cases = {key: self.current[number] for key, number in self.sites.items() if number in self.current}
+        sources = {key[0]: self.source[key[0]] for key in blocked | cases.keys()}
+        return sources, blocked, cases
+
+    def merge_worker_report(self, nodeid, report):
+        sources, blocked, cases = report
+        for file, digest in sources.items():
+            if self.source.setdefault(file, digest) != digest:
+                raise RuntimeError(f"source changed during worker recording: {file}")
+        for key in blocked:
+            self.blocked.add(self.sites.setdefault(key, len(self.sites)))
+        result = self.results.get(nodeid)
+        if result is None:
+            return
+        for key, worker_cases in cases.items():
+            number = self.sites.setdefault(key, len(self.sites))
+            main_cases = result.get(number, set())
+            if worker_cases is None or main_cases is None:
+                result[number] = None
+            else:
+                combined = main_cases | worker_cases
+                result[number] = combined if len(combined) <= MAX_CASES else None
+
     def export(self):
+        if self.workers is not None:
+            self.workers.merge(self)
         grouped = {}
         count = 0
         for nodeid, observations in sorted(self.results.items()):
@@ -286,12 +320,14 @@ def main():
     parser.add_argument("pytest_args", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     catalog = json.loads(args.catalog.read_text("utf-8"))["tests"]
-    recorder = Recorder(Path.cwd(), {test["id"] for test in catalog})
-    recorder.install()
-    result = pytest.main(["-q", "-p", "no:cacheprovider", *args.pytest_args], plugins=[recorder])
-    if result != pytest.ExitCode.OK:
-        return result
-    serialized = json.dumps(recorder.export(), separators=(",", ":")).encode("utf-8")
+    tests = {test["id"] for test in catalog}
+    with tempfile.TemporaryDirectory(prefix="comparison-workers-") as trace:
+        recorder = Recorder(Path.cwd(), tests, WorkerRecordings(trace))
+        recorder.install()
+        result = pytest.main(["-q", "-p", "no:cacheprovider", *args.pytest_args], plugins=[recorder])
+        if result != pytest.ExitCode.OK:
+            return result
+        serialized = json.dumps(recorder.export(), separators=(",", ":")).encode("utf-8")
     args.output.write_bytes(gzip.compress(serialized, mtime=0))
     return 0
 
