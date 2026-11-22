@@ -98,3 +98,30 @@ SKIP_INTEGRATION=0 PYTHONPATH="$KIT:$KIT/tools:${PYTHONPATH:-}" \
 PYTHONPATH="$KIT:${PYTHONPATH:-}" python -B "$KIT/tools/record_expr_validation.py" \
   "$TRACE" "$KIT/sample/tests.json" "$KIT/expr_validation_reads.json.gz"
 ```
+
+## Small-group replay experiment
+
+`verify_small_groups.py` checks saved selector schedules on Linux using the pinned Docker base,
+`requirements.lock` and the full SQLGlot checkout at `eb11aec4`. It offers one-worker schedules
+of up to four tests and 200 ms of recorded test time. A fresh child runs pytest against the
+patched module. Only a confirmed pass of the entire group clears the worker.
+
+Set `STOCK` to the absolute path to the pinned checkout and `KIT` to this repository. Prepare
+the checkout's bytecode caches before measuring replay time. Save the selector's JSONL as
+`/tmp/base-selection.jsonl`.
+
+```sh
+(
+  cd "$STOCK"
+  python -m compileall -q --invalidation-mode checked-hash sqlglot tests
+  PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 SKIP_INTEGRATION=0 \
+    python -m pytest --collect-only -q -p no:cacheprovider tests
+)
+PYTHONHASHSEED=0 python -B "$KIT/tools/verify_small_groups.py" "$STOCK" \
+  "$KIT/sample/commits" "$KIT/sample/tests.json" /tmp/base-selection.jsonl \
+  > /tmp/replayed-selection.jsonl
+```
+
+Use `score.py` to compare simulated seconds. Measure the whole replay process and its children
+to calculate the added CPU. The loop CPU printed to stderr excludes interpreter startup and
+initial imports. The submission image does not run this experiment.
