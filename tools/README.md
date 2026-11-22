@@ -30,10 +30,11 @@ Everything comes from sqlglot at the pinned commit `eb11aec4`. No sample answers
    pass reports or unobserved subprocess work retain their baseline selection.
    The map includes the source hashes and the test catalog it was built for.
 7. `record_tpcds_query_lines.py` records the pinned probe's source lines by
-   query, including startup separately. The selector can test a late query
-   early when coverage points to it. Only a difference ends the probe early.
-   A match, timeout or unusable result still triggers the complete comparison
-   in the original query order.
+   query, including startup separately. The index binds the source archive,
+   probe code and queries by hash. Only a difference ends the probe early.
+   A match, timeout or unusable result triggers the complete comparison in
+   order. The selector skips the probe if removing TPC-DS would save no
+   simulated scheduling time.
 
 To regenerate the setting map, create an empty trace directory and run from
 the pinned checkout with CPython 3.13 and the locked test dependencies.
@@ -63,4 +64,37 @@ PYTHONPATH="$KIT:${PYTHONPATH:-}" python -B "$KIT/tools/record_settings.py" \
 ```sh
 SKIP_INTEGRATION=0 BR_DICT_OUT=$TRACE PYTHONPATH="$KIT/tools:$PWD" python -B -m pytest -p record_dictkeys -q tests
 python "$KIT/tools/record_dictkeys.py" "$TRACE" "$KIT/sample/tests.json" "$PWD" "$KIT/dict_keys.json.gz"
+```
+
+9. `record_lazy_import.py` captures the files read by the clean
+   `import sqlglot` subprocess in the pinned lazy-load test. Docker builds
+   this map from the pinned archive. The selector can omit the test when
+   every change is a validated edit to an existing Python source outside
+   that import's dependencies.
+10. `record_comparisons.py` captures values and types observed at comparison
+    sites during passing tests. The selector evaluates a single operator or
+    literal change against those facts at runtime. Comparisons with
+    unsupported operands, shared setup, imports or unobserved workers keep
+    their normal selection.
+11. `record_expr_validation.py` captures expression argument validation and
+    metadata readers in the pinned suite. A single boolean change to an
+    existing `arg_types` key can use this map after a successful import.
+    Whole metadata readers, unverified tests and blocked observations keep
+    their normal coverage.
+
+Generate the comparison and validation maps from the pinned checkout with
+CPython 3.13, the locked test dependencies and integration tests enabled.
+Tests omitted from recording remain unverified.
+
+```sh
+SKIP_INTEGRATION=0 PYTHONPATH="$KIT:${PYTHONPATH:-}" \
+  python -B "$KIT/tools/record_comparisons.py" "$KIT/sample/tests.json" \
+  "$KIT/comparison_reads.json.gz" tests -k 'not test_max_nodes and not test_generator_memory'
+
+SKIP_INTEGRATION=0 PYTHONPATH="$KIT:$KIT/tools:${PYTHONPATH:-}" \
+  BR_EXPR_CATALOG="$KIT/sample/tests.json" BR_EXPR_TRACE="$TRACE" \
+  python -B -m pytest -p record_expr_validation -p no:cacheprovider --assert=plain \
+  --deselect=tests/test_parser.py::TestParser::test_max_nodes -q tests
+PYTHONPATH="$KIT:${PYTHONPATH:-}" python -B "$KIT/tools/record_expr_validation.py" \
+  "$TRACE" "$KIT/sample/tests.json" "$KIT/expr_validation_reads.json.gz"
 ```

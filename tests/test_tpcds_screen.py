@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from selector import check_tpcds_inputs
+from selector import check_tpcds_inputs, scheduled_cost_ms
 
 
 class TpcdsScreenTests(unittest.TestCase):
@@ -25,3 +25,7 @@ class TpcdsScreenTests(unittest.TestCase):
             SimpleNamespace(returncode=0, stdout="SAME\n"),
         ]):
             self.assertTrue(check_tpcds_inputs(["probe"], {}, (23,)))
+
+    def test_empty_schedule_and_longest_worker_use_the_scorer_cost(self):
+        self.assertEqual(scheduled_cost_ms([], {}), 0)
+        self.assertEqual(scheduled_cost_ms([[1], [2, 3]], {1: 5000, 2: 2000, 3: 1000}), 9000)

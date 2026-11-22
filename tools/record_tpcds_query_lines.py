@@ -88,6 +88,7 @@ def main():
         "version": INDEX_VERSION,
         "inputs_sha256": hashlib.sha256(inputs).hexdigest(),
         "source_sha256": hashlib.sha256(archive_path.read_bytes()).hexdigest(),
+        "probe_sha256": hashlib.sha256((ROOT / "tpcds_probe.py").read_bytes()).hexdigest(),
         "query_count": query_count,
         "lines": lines,
     }

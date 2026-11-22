@@ -18,11 +18,17 @@ class QueryIndexTests(unittest.TestCase):
         directory = TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.inputs = Path(directory.name, "inputs.json")
+        self.source = Path(directory.name, "source.tgz")
+        self.probe = Path(directory.name, "probe.py")
         self.index = Path(directory.name, "query_lines.json.gz")
         self.inputs.write_text(json.dumps({"queries": [[], [], [], []]}), encoding="utf-8")
+        self.source.write_bytes(b"pinned sources")
+        self.probe.write_bytes(b"pinned probe")
         data = {
-            "version": 1,
+            "version": 2,
             "inputs_sha256": hashlib.sha256(self.inputs.read_bytes()).hexdigest(),
+            "source_sha256": hashlib.sha256(self.source.read_bytes()).hexdigest(),
+            "probe_sha256": hashlib.sha256(self.probe.read_bytes()).hexdigest(),
             "query_count": 4,
             "lines": {
                 "sqlglot/parser.py": {"10": 0b1010, "11": 0b10001},
@@ -34,7 +40,7 @@ class QueryIndexTests(unittest.TestCase):
     def load_index(self):
         from tpcds_query_index import QueryIndex
 
-        return QueryIndex.load(self.index, self.inputs)
+        return QueryIndex.load(self.index, self.inputs, self.source, self.probe)
 
     def test_unions_query_coverage_in_fixture_order(self):
         index = self.load_index()
@@ -53,6 +59,14 @@ class QueryIndexTests(unittest.TestCase):
     def test_ignores_index_when_inputs_change(self):
         self.inputs.write_text('{"queries":[]}', encoding="utf-8")
         self.assertIsNone(self.load_index())
+
+    def test_ignores_index_when_probe_or_source_changes(self):
+        for path in (self.source, self.probe):
+            with self.subTest(path=path):
+                before = path.read_bytes()
+                path.write_bytes(before + b" changed")
+                self.assertIsNone(self.load_index())
+                path.write_bytes(before)
 
     def test_ignores_invalid_index_file(self):
         self.index.write_bytes(b"not gzip")

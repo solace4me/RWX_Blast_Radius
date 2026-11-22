@@ -22,6 +22,7 @@ import bisect
 import gzip
 import io
 import tarfile
+import math
 import os
 import subprocess
 import tokenize
@@ -35,11 +36,16 @@ from pathlib import Path
 from setting_index import SettingIndex, edited_setting
 from tpcds_query_index import QueryIndex
 from dictkey_index import DictKeyIndex
+from compare_index import ComparisonIndex
+from expr_validation_index import ExprValidationIndex
 
 DATA = Path("/data")
 MAP_PATH = Path(__file__).with_name("map.json.gz")
 SETTING_READS = Path(__file__).with_name("setting_reads.json.gz")
 DICT_KEYS = Path(__file__).with_name("dict_keys.json.gz")
+COMPARISON_READS = Path(__file__).with_name("comparison_reads.json.gz")
+EXPR_VALIDATION_READS = Path(__file__).with_name("expr_validation_reads.json.gz")
+COLD_IMPORTS = Path(__file__).with_name("cold_imports.json")
 SRC_PATH = Path(__file__).with_name("sqlglot_src.tgz")
 TPCDS_PROBE = Path(__file__).with_name("tpcds_probe.py")
 TPCDS_INPUTS = Path(__file__).with_name("tpcds_inputs.json")
@@ -47,6 +53,7 @@ TPCDS_BASE = Path(__file__).with_name("tpcds_base.json")  # written at image bui
 TPCDS_TYPES = Path(__file__).with_name("tpcds_types.json")
 TPCDS_QUERY_LINES = Path(__file__).with_name("tpcds_query_lines.json.gz")
 TPCDS_ID = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+LAZY_LOAD_ID = "tests/dialects/test_dialect.py::TestDialect::test_lazy_load"
 TPCDS_SCREEN_MIN_QUERY = 8
 WORKER_COST_MS = 2000
 MAX_WORKERS = 8
@@ -59,9 +66,17 @@ def log(*a):
     print(*a, file=sys.stderr)
 
 
+def load_optional_index(index_type, path, tests):
+    try:
+        return index_type.load(path, tests) if path.is_file() else None
+    except (AttributeError, EOFError, KeyError, OSError, TypeError, ValueError, zlib.error) as ex:
+        log(f"{path.name} disabled:", repr(ex))
+        return None
+
+
 class Selector:
     def __init__(self, tests, m):
-        self.ms = {t["number"]: round(t["seconds"] * 1000) for t in tests}
+        self.ms = {t["number"]: math.floor(t["seconds"] * 1000 + 0.5) for t in tests}
         self.all = set(self.ms)
         self.by_test_file = {}
         for t in tests:
@@ -95,22 +110,16 @@ class Selector:
                 st.update(range(a, b + 1))
             self.tpcds_exec[f] = st
         self.tpcds = {t["number"] for t in tests if t["id"] == TPCDS_ID}
-        self.tpcds_queries = QueryIndex.load(TPCDS_QUERY_LINES, TPCDS_INPUTS) if self.tpcds else None
+        self.tpcds_queries = QueryIndex.load(
+            TPCDS_QUERY_LINES, TPCDS_INPUTS, SRC_PATH, TPCDS_PROBE
+        ) if self.tpcds else None
         self.tpcds_types = {}
         if self.tpcds and TPCDS_TYPES.is_file():
             self.tpcds_types = json.loads(TPCDS_TYPES.read_text("utf-8"))
-        self.dict_index = None
-        if DICT_KEYS.is_file():
-            try:
-                self.dict_index = DictKeyIndex.load(DICT_KEYS, tests)
-            except (AttributeError, EOFError, KeyError, OSError, TypeError, ValueError, zlib.error) as ex:
-                log("dict key map disabled:", repr(ex))
-        self.setting_index = None
-        if SETTING_READS.is_file():
-            try:
-                self.setting_index = SettingIndex.load(SETTING_READS, tests)
-            except (AttributeError, EOFError, KeyError, OSError, TypeError, ValueError, zlib.error) as ex:
-                log("setting read map disabled:", repr(ex))
+        self.dict_index = load_optional_index(DictKeyIndex, DICT_KEYS, tests)
+        self.setting_index = load_optional_index(SettingIndex, SETTING_READS, tests)
+        self.comparisons = load_optional_index(ComparisonIndex, COMPARISON_READS, tests)
+        self.expr_validation = load_optional_index(ExprValidationIndex, EXPR_VALIDATION_READS, tests)
         self.import_lines = {}
         for f, rs in m.get("importlines", {}).items():
             st = set()
@@ -122,6 +131,8 @@ class Selector:
         seen = set().union(*self.file_tests.values(), *self.opened.values())
         self.blind = self.all - seen
         self.test_id = {t["number"]: t["id"] for t in tests}
+        self.lazy_load = {n for n, tid in self.test_id.items() if tid == LAZY_LOAD_ID}
+        self.cold_imports = load_cold_imports(COLD_IMPORTS) if self.lazy_load else set()
         self.generator_memory = {
             n for n, tid in self.test_id.items() if tid.endswith("::test_generator_memory")
         }
@@ -383,30 +394,26 @@ class Selector:
                 notes.append("import raises -> all")
             else:
                 notes.append("imports ok")
-                if len(entries) == 1 and self.setting_index:
+                if len(entries) == 1 and entries[0].path in patched:
                     f = entries[0].path
                     before = original_source(f)
-                    if f in patched and before is not None and self.setting_index.matches_source(f, before):
-                        setting = edited_setting(before, patched[f])
-                        narrowed = self.setting_index.narrow(f, setting, sel)
-                        if narrowed is not None:
-                            # Source inspections and tests outside the line map retain
-                            # the original selector's conservative treatment.
-                            narrowed |= set(self.opened.get(f, ())) | (sel & self.blind)
-                            if len(narrowed) < len(sel):
-                                notes.append(f"setting reads: {len(sel)} -> {len(narrowed)}")
-                                sel = narrowed
-                if len(entries) == 1 and self.dict_index:
-                    f = entries[0].path
-                    before = original_source(f)
-                    if f in patched and before is not None:
-                        narrowed = self.dict_index.narrow(f, before, patched[f], sel)
-                        if narrowed is not None:
-                            # tests outside the recording keep the normal treatment
-                            narrowed |= set(self.opened.get(f, ())) | (sel & self.blind)
-                            if len(narrowed) < len(sel):
-                                notes.append(f"dict key reads: {len(sel)} -> {len(narrowed)}")
-                                sel = narrowed
+                    if before is not None:
+                        sel = self.refine_import_selection(f, before, patched[f], sel, notes)
+        if self.comparisons and sel != self.all and not import_modules and len(entries) == 1:
+            f = entries[0].path
+            if runtime_lines.get(f) and f in patched:
+                narrowed = self.comparisons.narrow(f, original_source(f), patched[f], sel)
+                if narrowed is not None:
+                    narrowed |= set(self.opened.get(f, ())) | (sel & self.blind)
+                    if narrowed != sel:
+                        notes.append(f"comparison reads: {len(sel)} -> {len(narrowed)}")
+                        sel = narrowed
+        if (
+            sel != self.all and sel & self.lazy_load
+            and cold_import_unaffected(entries, patched, self.cold_imports)
+        ):
+            sel -= self.lazy_load
+            notes.append("lazy load: changed sources outside cold import")
         if (
             tpcds_ok
             and not tpcds_import_blocked
@@ -431,6 +438,14 @@ class Selector:
             if touched:
                 notes.append("tpcds: executor-side lines changed, keep")
             else:
+                chosen = sel & self.all
+                saving = (
+                    scheduled_cost_ms(split(chosen, self.ms), self.ms)
+                    - scheduled_cost_ms(split(chosen - self.tpcds, self.ms), self.ms)
+                )
+                if saving <= 0:
+                    notes.append("tpcds: removal would not reduce scheduling cost")
+                    return sel, notes
                 try:
                     queries = self.tpcds_queries.affected_queries(runtime_lines) if self.tpcds_queries else None
                     screen = queries[:1] if queries and queries[0] >= TPCDS_SCREEN_MIN_QUERY else ()
@@ -447,6 +462,26 @@ class Selector:
                 else:
                     notes.append("tpcds: inputs differ, keep")
         return sel, notes
+
+    def refine_import_selection(self, file, before, after, chosen, notes):
+        keep = set(self.opened.get(file, ())) | (chosen & self.blind)
+        if self.setting_index and self.setting_index.matches_source(file, before):
+            change = edited_setting(before, after)
+            narrowed = self.setting_index.narrow(file, change, chosen)
+            if narrowed is not None and (narrowed | keep) != chosen:
+                notes.append(f"setting reads: {len(chosen)} -> {len(narrowed | keep)}")
+                chosen = narrowed | keep
+        for name, index in (
+            ("dict key reads", self.dict_index),
+            ("expression validation", self.expr_validation),
+        ):
+            if index is None:
+                continue
+            narrowed = index.narrow(file, before, after, chosen)
+            if narrowed is not None and (narrowed | keep) != chosen:
+                notes.append(f"{name}: {len(chosen)} -> {len(narrowed | keep)}")
+                chosen = narrowed | keep
+        return chosen
 
     def tpcds_import_allowed(self, f):
         """A SQL dialect's own file (dialects/parsers/generators/typing/tokenizers
@@ -477,6 +512,26 @@ class Selector:
 
 
 _SOURCES = None
+
+
+def load_cold_imports(path):
+    try:
+        files = json.loads(path.read_text("utf-8"))
+    except (OSError, ValueError):
+        return set()
+    if not isinstance(files, list) or not all(isinstance(file, str) for file in files):
+        return set()
+    return set(files) if "sqlglot/__init__.py" in files else set()
+
+
+def cold_import_unaffected(entries, patched, cold_imports):
+    """Only allow validated edits to existing sources that cold startup never reads."""
+    return bool(cold_imports and entries) and all(
+        e.path in patched and e.path not in cold_imports
+        and e.path.startswith("sqlglot/") and e.path.endswith(".py")
+        and e.hunks and not (e.added or e.deleted or e.renamed or e.binary)
+        for e in entries
+    )
 
 
 def original_source(path):
@@ -1098,10 +1153,15 @@ def split(sel, ms):
     return best[1]
 
 
+def scheduled_cost_ms(workers, ms):
+    loads = [sum(ms[n] for n in worker) for worker in workers if worker]
+    return max(loads, default=0) + WORKER_COST_MS * len(loads)
+
+
 def main():
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
     all_tests = {t["number"] for t in tests}
-    ms = {t["number"]: round(t["seconds"] * 1000) for t in tests}
+    ms = {t["number"]: math.floor(t["seconds"] * 1000 + 0.5) for t in tests}
     try:
         selector = Selector(tests, json.loads(gzip.decompress(MAP_PATH.read_bytes())))
     except Exception as e:  # no map -> safe fallback

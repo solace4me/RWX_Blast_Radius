@@ -7,7 +7,7 @@ from pathlib import Path
 import zlib
 
 
-INDEX_VERSION = 1
+INDEX_VERSION = 2
 
 
 class QueryIndex:
@@ -17,13 +17,19 @@ class QueryIndex:
         self.startup_bit = 1 << query_count
 
     @classmethod
-    def load(cls, index_path, inputs_path):
-        """Read the optional index if it matches the exact ordered query fixture."""
+    def load(cls, index_path, inputs_path, source_path, probe_path):
+        """Read the optional index if it matches the source, probe and query order."""
         try:
             with gzip.open(index_path, "rt", encoding="utf-8") as stream:
                 data = json.load(stream)
             inputs = Path(inputs_path).read_bytes()
-            if data["version"] != INDEX_VERSION or data["inputs_sha256"] != hashlib.sha256(inputs).hexdigest():
+            if data["version"] != INDEX_VERSION:
+                return None
+            if (
+                data["inputs_sha256"] != hashlib.sha256(inputs).hexdigest()
+                or data["source_sha256"] != hashlib.sha256(Path(source_path).read_bytes()).hexdigest()
+                or data["probe_sha256"] != hashlib.sha256(Path(probe_path).read_bytes()).hexdigest()
+            ):
                 return None
 
             query_count = len(json.loads(inputs)["queries"])
